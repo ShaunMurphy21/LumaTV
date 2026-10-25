@@ -525,7 +525,10 @@ class MainActivity : Activity() {
         column.addView(Ui.text(this, "Couldn't load your library", 25f, Ui.WHITE, true), Ui.columnParams(this, 12))
         column.addView(Ui.text(this, errorText.ifBlank { "The playlist may be unavailable. Check your connection and provider settings." }, 14f, Ui.MUTED), Ui.columnParams(this, 20))
         column.addView(Ui.button(this, "Try again") { refresh() }, Ui.columnParams(this, 12))
-        column.addView(Ui.button(this, "Change source", false) { disconnect() })
+        column.addView(Ui.button(this, "Edit source details", false) {
+            val kind = AppData.config?.kind ?: "xtream"
+            connectDialog(if (kind == "m3u") "m3u" else "xtream")
+        })
         scroll.addView(column); body.addView(scroll)
     }
 
@@ -952,14 +955,15 @@ class MainActivity : Activity() {
     }
 
     private fun connectDialog(kind: String) {
+        val current = AppData.config?.takeIf { it.kind == kind }
         val fields = Ui.vertical(this).apply { setPadding(dp(20), dp(14), dp(20), dp(4)) }
-        val name = input("Provider name", if (kind == "m3u") "My playlist" else "My IPTV", fields)
-        val url = input(if (kind == "m3u") "M3U URL (https://…)" else "Server URL (https://host:port)", "", fields)
-        val user = if (kind == "xtream") input("Username", "", fields) else null
-        val pass = if (kind == "xtream") input("Password", "", fields).apply {
+        val name = input("Provider name", current?.name ?: if (kind == "m3u") "My playlist" else "My IPTV", fields)
+        val url = input(if (kind == "m3u") "M3U URL (https://…)" else "Server URL (https://host:port)", current?.url.orEmpty(), fields)
+        val user = if (kind == "xtream") input("Username", current?.username.orEmpty(), fields) else null
+        val pass = if (kind == "xtream") input("Password", current?.password.orEmpty(), fields).apply {
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
         } else null
-        val epg = input("XMLTV EPG URL (optional)", "", fields)
+        val epg = input("XMLTV EPG URL (optional)", current?.epgUrl.orEmpty(), fields)
         val scroll = ScrollView(this).apply { addView(fields) }
         val dialog = AlertDialog.Builder(this).setTitle(if (kind == "m3u") "Import M3U playlist" else "Connect Xtream provider")
             .setView(scroll).setNegativeButton("Cancel", null)
@@ -1015,13 +1019,19 @@ class MainActivity : Activity() {
     }
 
     private fun connect(config: ProviderConfig) {
+        val old = AppData.config
+        val sameSource = old != null && old.kind == config.kind &&
+            old.url == config.url && old.username == config.username &&
+            old.password == config.password
         cancelImportRequested = true
-        storage.clearProvider()
+        if (!sameSource) {
+            storage.clearProvider()
+            AppData.entries = emptyList()
+            AppData.schedules = emptyMap()
+            AppData.catalogReport = ""
+            AppData.episodeQueue = emptyList(); AppData.episodeQueueFor = ""
+        }
         AppData.config = config
-        AppData.entries = emptyList()
-        AppData.schedules = emptyMap()
-        AppData.catalogReport = ""
-        AppData.episodeQueue = emptyList(); AppData.episodeQueueFor = ""
         storage.saveProvider(config)
         cancelImportRequested = false
         liveLoading = false
