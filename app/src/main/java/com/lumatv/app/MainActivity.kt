@@ -639,20 +639,19 @@ class MainActivity : Activity() {
         render()
         worker.execute {
             try {
-                val fetched = SourceService.loadProviderCategory(config, selected)
-                if (AppData.config != config) return@execute
-                val current = AppData.entries
-                val merged = (current + fetched).distinctBy { it.id }
-                storage.saveCatalog(merged)
+                if (!catalogue.isComplete(selected.type, selected.id)) {
+                    val fetched = SourceService.loadProviderCategory(config, selected)
+                    if (AppData.config != config) return@execute
+                    catalogue.storeCategory(selected, fetched)
+                }
                 main.post {
                     if (isFinishing || isDestroyed || AppData.config != config) return@post
-                    AppData.entries = merged
                     loading = false
                     tab = if (selected.type == ContentType.SERIES) "Series" else "Films"
                     category = selected.name
+                    browseOffset = 0
                     searchBox.hint = searchHint()
                     clearSearch()
-                    Toast.makeText(this, "Loaded ${fetched.size} titles from ${selected.name}", Toast.LENGTH_LONG).show()
                 }
             } catch (e: Exception) {
                 main.post {
@@ -1008,7 +1007,7 @@ class MainActivity : Activity() {
                     Toast.makeText(this, "Crash report copied", Toast.LENGTH_SHORT).show()
                 }.show()
         }, Ui.columnParams(this, 9))
-        panel.addView(Ui.text(this, "LumaTV 1.2.1 • Android & Fire TV • Local settings", 11f, Ui.MUTED), Ui.columnParams(this, 9))
+        panel.addView(Ui.text(this, "LumaTV 1.4.0 • Android & Fire TV • Local settings", 11f, Ui.MUTED), Ui.columnParams(this, 9))
         dialog.show()
     }
 
