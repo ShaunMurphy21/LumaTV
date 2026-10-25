@@ -12,6 +12,8 @@ import android.database.sqlite.SQLiteOpenHelper
 class CatalogDatabase(context: Context) :
     SQLiteOpenHelper(context.applicationContext, "lumatv_vod.db", null, 1) {
 
+    init { setWriteAheadLoggingEnabled(true) } // Readers remain responsive during imports.
+
     override fun onCreate(db: SQLiteDatabase) {
         db.execSQL("""
             CREATE TABLE titles(
@@ -48,37 +50,52 @@ class CatalogDatabase(context: Context) :
             arrayOf(type.name, categoryId)
         ).use { it.moveToFirst() }
 
-    /** One category transaction: interrupted imports never mark incomplete data done. */
+    /**
+     * One transaction and ONE compiled INSERT per category. Reusing the
+     * prepared statement is substantially cheaper on a Fire TV than building
+     * thousands of ContentValues objects and SQL statements.
+     */
     fun storeCategory(category: SourceService.ProviderCategory, rows: List<MediaEntry>) {
         val db = writableDatabase
-        db.beginTransaction()
+        db.beginTransactionNonExclusive()
         try {
             db.delete("titles", "type=? AND category_id=?", arrayOf(category.type.name, category.id))
-            rows.forEach { entry ->
-                val values = ContentValues().apply {
-                    put("id", entry.id)
-                    put("title", entry.title)
-                    put("type", entry.type.name)
-                    put("category_id", category.id)
-                    put("group_name", category.name)
-                    put("image", entry.image)
-                    put("description", entry.description)
-                    put("series_id", entry.seriesId)
-                    put("backdrop", entry.backdrop)
+            db.compileStatement("""
+                INSERT OR REPLACE INTO titles
+                (id,title,type,category_id,group_name,image,description,series_id,backdrop,stream_id,extension)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            """.trimIndent()).use { statement ->
+                for (entry in rows) {
+                    statement.clearBindings()
+                    statement.bindString(1, entry.id)
+                    statement.bindString(2, entry.title)
+                    statement.bindString(3, entry.type.name)
+                    statement.bindString(4, category.id)
+                    statement.bindString(5, category.name)
+                    statement.bindString(6, entry.image)
+                    statement.bindString(7, entry.description)
+                    statement.bindString(8, entry.seriesId)
+                    statement.bindString(9, entry.backdrop)
                     if (entry.type == ContentType.MOVIE) {
-                        // A movie URL has a sensitive username/password in its path.
-                        // Only retain its final stream ID/extension; restore on read.
+                        // Retain the stream token only, never provider credentials.
                         val file = entry.url.substringBefore('?').substringAfterLast('/')
-                        put("stream_id", file.substringBeforeLast('.', ""))
-                        put("extension", file.substringAfterLast('.', "mp4"))
+                        statement.bindString(10, file.substringBeforeLast('.', ""))
+                        statement.bindString(11, file.substringAfterLast('.', "mp4"))
+                    } else {
+                        statement.bindNull(10)
+                        statement.bindNull(11)
                     }
+                    statement.executeInsert()
                 }
-                db.insertWithOnConflict("titles", null, values, SQLiteDatabase.CONFLICT_REPLACE)
             }
             ContentValues().apply {
                 put("type", category.type.name)
                 put("category_id", category.id)
-            }.also { db.insertWithOnConflict("completed_categories", null, it, SQLiteDatabase.CONFLICT_REPLACE) }
+            }.also {
+                db.insertWithOnConflict(
+                    "completed_categories", null, it, SQLiteDatabase.CONFLICT_REPLACE
+                )
+            }
             db.setTransactionSuccessful()
         } finally {
             db.endTransaction()

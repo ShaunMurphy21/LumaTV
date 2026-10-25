@@ -51,12 +51,24 @@ class MainActivity : Activity() {
     private lateinit var body: FrameLayout
     private lateinit var searchBox: EditText
     private lateinit var footer: LinearLayout
+    private val tvNavigation = linkedMapOf<String, TextView>()
+    private var progressBarView: ProgressBar? = null
+    private var progressHeadline: TextView? = null
+    private var progressCounter: TextView? = null
+    private var progressSubtitle: TextView? = null
+    private var syncingLabel: TextView? = null
+    private var importing = false
+    private val searchRender = Runnable { if (::body.isInitialized && !isFinishing) render() }
     private val worker = Executors.newSingleThreadExecutor()
     private val main = Handler(Looper.getMainLooper())
     private var tab = "Home"
     private var category = "All"
     private var search = ""
-    private val isTv by lazy { packageManager.hasSystemFeature("android.software.leanback") }
+    private val isTv by lazy {
+        packageManager.hasSystemFeature("android.software.leanback") ||
+            (getSystemService(UI_MODE_SERVICE) as? android.app.UiModeManager)
+                ?.currentModeType == Configuration.UI_MODE_TYPE_TELEVISION
+    }
     private var predictiveBackCallback: android.window.OnBackInvokedCallback? = null
     private var loading = false
     private var errorText = ""
@@ -79,6 +91,7 @@ class MainActivity : Activity() {
                 predictiveBackCallback!!
             )
         }
+        if (isTv) tvNavigation["Home"]?.requestFocus()
         val provider = AppData.config
         if (provider == null) {
             render()
@@ -107,9 +120,15 @@ class MainActivity : Activity() {
         }
     }
 
+    private var hasResumedOnce = false
+
     override fun onResume() {
         super.onResume()
-        if (::body.isInitialized && !loading) render()
+        // Avoid destroying the Fire TV grid and losing D-pad position each
+        // time playback or another activity returns to the foreground.
+        if (hasResumedOnce && ::body.isInitialized && !loading &&
+            (!isTv || tab == "My List")) render()
+        hasResumedOnce = true
     }
 
     override fun onConfigurationChanged(newConfig: Configuration) {
@@ -124,6 +143,7 @@ class MainActivity : Activity() {
             predictiveBackCallback = null
         }
         worker.shutdownNow()
+        main.removeCallbacks(searchRender)
         super.onDestroy()
     }
 
@@ -151,13 +171,48 @@ class MainActivity : Activity() {
         header.addView(Ui.button(this, "⚙", false) { showSettings() }.apply {
             textSize = 21f; setPadding(dp(15), dp(7), dp(15), dp(7))
         })
+        if (isTv) {
+            syncingLabel = Ui.text(this, "", 13f, Ui.MINT, true).apply {
+                isFocusable = true
+                isClickable = true
+                setPadding(dp(12), dp(8), dp(12), dp(8))
+                setOnClickListener {
+                    if (importing) {
+                        loading = true
+                        render()
+                    }
+                }
+            }
+            header.addView(syncingLabel)
+        }
         root.addView(header)
+        tvNavigation.clear()
+        if (isTv) {
+            val nav = Ui.horizontal(this).apply {
+                setPadding(dp(24), dp(4), dp(24), dp(12))
+            }
+            val labels = listOf("Home", "Live TV", "Films", "Series", "My List")
+            labels.forEach { name ->
+                val button = Ui.text(this, name, 17f, Ui.WHITE, true).apply {
+                    gravity = Gravity.CENTER
+                    setPadding(dp(25), dp(13), dp(25), dp(13))
+                    isFocusable = true; isClickable = true
+                    setOnClickListener { selectTab(name) }
+                    setOnFocusChangeListener { _, _ -> updateTvNavigation() }
+                }
+                tvNavigation[name] = button
+                nav.addView(button, LinearLayout.LayoutParams(0, dp(50), 1f).apply {
+                    leftMargin = dp(5); rightMargin = dp(5)
+                })
+            }
+            root.addView(nav)
+        }
 
         searchBox = EditText(this).apply {
             hint = searchHint()
             setHintTextColor(Ui.MUTED)
             setTextColor(Ui.WHITE)
-            textSize = 14f
+            textSize = if (isTv) 17f else 14f
             isSingleLine = true
             background = Ui.bg(Ui.SURFACE, dp(15).toFloat())
             setPadding(dp(17), dp(12), dp(12), dp(12))
@@ -167,12 +222,15 @@ class MainActivity : Activity() {
                 override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
                     search = s?.toString().orEmpty()
                     browseOffset = 0
-                    if (::body.isInitialized) render()
+                    main.removeCallbacks(searchRender)
+                    main.postDelayed(searchRender, if (isTv) 280 else 220)
                 }
                 override fun afterTextChanged(s: Editable?) {}
             })
         }
-        val searchRow = Ui.horizontal(this).apply { setPadding(dp(16), 0, dp(16), dp(11)) }
+        val searchRow = Ui.horizontal(this).apply {
+            setPadding(dp(if (isTv) 36 else 16), 0, dp(if (isTv) 36 else 16), dp(11))
+        }
         searchRow.addView(searchBox, LinearLayout.LayoutParams(0, dp(if (isTv) 55 else 47), 1f))
         searchRow.addView(Ui.button(this, "✕", false) {
             clearSearch()
@@ -184,30 +242,79 @@ class MainActivity : Activity() {
             setPadding(dp(8), dp(8), dp(8), dp(10))
             setBackgroundColor(0xFF10131E.toInt())
         }
-        root.addView(footer)
+        if (!isTv) root.addView(footer)
+    }
+
+    private fun selectTab(name: String) {
+        tab = name
+        category = "All"
+        browseOffset = 0
+        clearSearch(false)
+        searchBox.hint = searchHint()
+        render()
+    }
+
+    private fun updateTvNavigation() {
+        tvNavigation.forEach { (name, button) ->
+            val focused = button.isFocused
+            val selected = name == tab
+            button.background = Ui.bg(
+                if (focused) Ui.MINT else if (selected) Ui.PANEL else Ui.BG,
+                dp(12).toFloat(), if (focused) Ui.WHITE else null
+            )
+            button.setTextColor(if (focused) Ui.BG else if (selected) Ui.MINT else Ui.WHITE)
+        }
+    }
+
+    private fun updateProgressViews() {
+        progressHeadline?.text = loadingMessage
+        progressBarView?.apply {
+            isIndeterminate = loadingTotal <= 0
+            max = loadingTotal.coerceAtLeast(1)
+            progress = (loadingDone + loadingFailures).coerceAtMost(max)
+        }
+        progressCounter?.text = if (loadingTotal > 0)
+            "${(loadingDone + loadingFailures).coerceAtMost(loadingTotal)} of $loadingTotal categories processed"
+        else "Connecting…"
+        progressSubtitle?.text =
+            "Films: $loadingFilms    Series: $loadingShows    Failed: $loadingFailures"
+        syncingLabel?.apply {
+            text = if (importing && loadingTotal > 0)
+                "Syncing ${(loadingDone + loadingFailures).coerceAtMost(loadingTotal)}/$loadingTotal"
+            else if (importing) "Syncing catalogue…" else ""
+            visibility = if (importing) View.VISIBLE else View.GONE
+        }
     }
 
     private fun render() {
         if (!::body.isInitialized) return
         body.removeAllViews()
-        footer.removeAllViews()
-        val tabs = listOf("Home" to "⌂", "Live TV" to "▣", "Films" to "▶", "Series" to "▤", "My List" to "♥")
-        tabs.forEach { (name, symbol) ->
-            val selected = tab == name
-            val column = Ui.vertical(this).apply {
-                gravity = Gravity.CENTER; setPadding(1, dp(2), 1, dp(2)); isClickable = true
-                isFocusable = true
-                background = Ui.bg(if (selected) Ui.PANEL else 0xFF10131E.toInt(), dp(9).toFloat())
-                Ui.tvFocus(this)
-                setOnClickListener {
-                    tab = name; category = "All"; browseOffset = 0
-                    clearSearch(); searchBox.hint = searchHint(); render()
+        if (isTv) {
+            updateTvNavigation()
+        } else {
+            footer.removeAllViews()
+            val tabs = listOf("Home" to "⌂", "Live TV" to "▣", "Films" to "▶", "Series" to "▤", "My List" to "♥")
+            tabs.forEach { (name, symbol) ->
+                val selected = tab == name
+                val column = Ui.vertical(this).apply {
+                    gravity = Gravity.CENTER
+                    setPadding(1, dp(2), 1, dp(2))
+                    isClickable = true; isFocusable = true
+                    background = Ui.bg(if (selected) Ui.PANEL else 0xFF10131E.toInt(), dp(9).toFloat())
+                    Ui.tvFocus(this)
+                    setOnClickListener { selectTab(name) }
                 }
+                column.addView(Ui.text(this, symbol, 19f, if (selected) Ui.MINT else Ui.MUTED, selected).apply {
+                    gravity = Gravity.CENTER
+                })
+                column.addView(Ui.text(this, name, 10f, if (selected) Ui.WHITE else Ui.MUTED, selected).apply {
+                    gravity = Gravity.CENTER
+                })
+                footer.addView(column, LinearLayout.LayoutParams(0, dp(54), 1f))
             }
-            column.addView(Ui.text(this, symbol, if (isTv) 23f else 19f, if (selected) Ui.MINT else Ui.MUTED, selected).apply { gravity = Gravity.CENTER })
-            column.addView(Ui.text(this, name, if (isTv) 15f else 10f, if (selected) Ui.WHITE else Ui.MUTED, selected).apply { gravity = Gravity.CENTER })
-            footer.addView(column, LinearLayout.LayoutParams(0, dp(if (isTv) 70 else 54), 1f))
         }
+        if (loading) { showLoading(); return }
+        if (AppData.config == null) { showWelcome(); return }
         val visible = storage.visibleEntries(AppData.entries).filter { it.type != ContentType.EPISODE }
         val vodType = if (SourceService.xtreamFor(AppData.config ?: ProviderConfig("", "", "")) != null)
             when (tab) {
@@ -235,9 +342,7 @@ class MainActivity : Activity() {
             }
         }
         when {
-            loading -> showLoading()
-            AppData.config == null -> showWelcome()
-            AppData.entries.isEmpty() && browsingTotal == 0 &&
+AppData.entries.isEmpty() && browsingTotal == 0 &&
                 catalogue.count(ContentType.MOVIE) == 0 && catalogue.count(ContentType.SERIES) == 0 -> showError()
             search.isNotBlank() -> showBrowse(matches, "Search ${tab.lowercase()}")
             tab == "Home" -> showHome(visible)
@@ -253,7 +358,7 @@ class MainActivity : Activity() {
         else -> "⌕   Search all titles"
     }
 
-    private fun clearSearch() {
+    private fun clearSearch(redraw: Boolean = true) {
         search = ""
         if (::searchBox.isInitialized) {
             if (searchBox.text.isNotEmpty()) searchBox.setText("")
@@ -261,14 +366,15 @@ class MainActivity : Activity() {
             (getSystemService(INPUT_METHOD_SERVICE) as? InputMethodManager)
                 ?.hideSoftInputFromWindow(searchBox.windowToken, 0)
         }
-        if (::body.isInitialized) render()
+        main.removeCallbacks(searchRender)
+        if (redraw && ::body.isInitialized) render()
     }
 
     private fun consumeBackNavigation(): Boolean {
         when {
             search.isNotBlank() -> clearSearch()
             category != "All" -> { category = "All"; render() }
-            tab != "Home" -> { tab = "Home"; searchBox.hint = searchHint(); render() }
+            tab != "Home" -> { selectTab("Home"); tvNavigation["Home"]?.requestFocus() }
             else -> return false
         }
         return true
@@ -282,39 +388,37 @@ class MainActivity : Activity() {
     private fun showLoading() {
         val shell = Ui.vertical(this).apply {
             gravity = Gravity.CENTER
-            setPadding(dp(22), dp(18), dp(22), dp(18))
+            setPadding(dp(if (isTv) 75 else 22), dp(18), dp(if (isTv) 75 else 22), dp(18))
         }
-        shell.addView(Ui.text(this, "Building your IPTV library", 24f, Ui.WHITE, true).apply {
+        shell.addView(Ui.text(this, "BUILDING YOUR LIBRARY",
+            if (isTv) 29f else 24f, Ui.WHITE, true).apply {
             gravity = Gravity.CENTER
-        }, Ui.columnParams(this, 18))
-        shell.addView(Ui.text(this, loadingMessage, 15f, Ui.MINT, true).apply {
-            gravity = Gravity.CENTER
-            maxLines = 2
-        }, Ui.columnParams(this, 16))
-        val indicator = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
-            max = if (loadingTotal > 0) loadingTotal else 100
-            progress = if (loadingTotal > 0) loadingDone.coerceIn(0, loadingTotal) else 0
-            isIndeterminate = loadingTotal == 0
+        }, Ui.columnParams(this, if (isTv) 20 else 16))
+        progressHeadline = Ui.text(this, loadingMessage,
+            if (isTv) 19f else 15f, Ui.MINT, true).apply {
+            gravity = Gravity.CENTER; maxLines = 2
         }
-        shell.addView(indicator, LinearLayout.LayoutParams(-1, dp(14)))
-        val fraction = if (loadingTotal > 0) "$loadingDone / $loadingTotal categories" else "Connecting…"
-        shell.addView(Ui.text(this, fraction, 16f, Ui.WHITE, true).apply {
+        shell.addView(progressHeadline, Ui.columnParams(this, 12))
+        progressBarView = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal)
+        shell.addView(progressBarView, LinearLayout.LayoutParams(-1, dp(16)))
+        progressCounter = Ui.text(this, "", if (isTv) 19f else 16f, Ui.WHITE, true).apply {
             gravity = Gravity.CENTER
-        }, Ui.columnParams(this, 14))
-        if (loadingTotal > 0) {
-            shell.addView(Ui.text(this,
-                "Films: $loadingFilms     Series: $loadingShows     Failed: $loadingFailures",
-                13f, Ui.MUTED).apply { gravity = Gravity.CENTER }, Ui.columnParams(this, 15))
-            shell.addView(Ui.text(this,
-                "Importing all provider categories into device storage. Already completed categories are skipped after reopening the app.",
-                12f, Ui.MUTED).apply { gravity = Gravity.CENTER },
-                Ui.columnParams(this, 16))
-            shell.addView(Ui.button(this, "Browse downloaded titles", false) {
-                loading = false
-                render()
-            })
         }
+        shell.addView(progressCounter, Ui.columnParams(this, 12))
+        progressSubtitle = Ui.text(this, "", if (isTv) 15f else 13f, Ui.MUTED).apply {
+            gravity = Gravity.CENTER
+        }
+        shell.addView(progressSubtitle, Ui.columnParams(this, 12))
+        shell.addView(Ui.text(this, "Downloading in parallel • saved by category • safe to resume",
+            12f, Ui.MUTED).apply { gravity = Gravity.CENTER }, Ui.columnParams(this, 14))
+        shell.addView(Ui.button(this, "Browse what's ready  ▶", false) {
+            loading = false
+            progressBarView = null; progressHeadline = null
+            progressCounter = null; progressSubtitle = null
+            selectTab(if (loadingShows > 0) "Series" else if (loadingFilms > 0) "Films" else "Live TV")
+        }, Ui.columnParams(this, 8))
         body.addView(shell, FrameLayout.LayoutParams(-1, -1))
+        updateProgressViews()
     }
 
     private fun showWelcome() {
@@ -434,7 +538,10 @@ class MainActivity : Activity() {
             setPadding(dp(12), 0, dp(12), dp(6))
             isNestedScrollingEnabled = false
         }
-        parent.addView(rv, LinearLayout.LayoutParams(-1, dp(239)).apply { bottomMargin = dp(11) })
+        rv.setItemViewCacheSize(if (isTv) 12 else 6)
+        parent.addView(rv, LinearLayout.LayoutParams(-1, dp(if (isTv) 285 else 239)).apply {
+            bottomMargin = dp(11)
+        })
     }
 
     private fun showBrowse(data: List<MediaEntry>, heading: String) {
@@ -468,7 +575,8 @@ class MainActivity : Activity() {
                     gravity = Gravity.CENTER
                     background = Ui.bg(if (category == name) Ui.MINT else Ui.PANEL, dp(20).toFloat())
                     setPadding(dp(14), dp(9), dp(14), dp(9))
-                    isClickable = true
+                    isClickable = true; isFocusable = true
+                    if (isTv) Ui.tvFocus(this)
                     setOnClickListener { category = name; browseOffset = 0; render() }
                 }
                 chips.addView(chip, LinearLayout.LayoutParams(-2, -2).apply { rightMargin = dp(8) })
@@ -502,6 +610,8 @@ class MainActivity : Activity() {
             }
         } else {
             val span = when {
+                isTv && resources.configuration.screenWidthDp >= 1050 -> 6
+                isTv -> 5
                 resources.configuration.screenWidthDp >= 840 -> 5
                 resources.configuration.screenWidthDp >= 600 -> 4
                 resources.configuration.screenWidthDp >= 385 -> 3
@@ -510,8 +620,10 @@ class MainActivity : Activity() {
             layout.addView(RecyclerView(this).apply {
                 layoutManager = GridLayoutManager(this@MainActivity, span)
                 adapter = MediaAdapter(filtered, horizontal = false)
-                setPadding(dp(9), 0, dp(9), dp(20))
+                setPadding(dp(if (isTv) 28 else 9), dp(6), dp(if (isTv) 28 else 9), dp(20))
                 clipToPadding = false
+                setItemViewCacheSize(if (isTv) 16 else 6)
+                descendantFocusability = ViewGroup.FOCUS_AFTER_DESCENDANTS
             }, LinearLayout.LayoutParams(-1, 0, 1f))
             if ((tab == "Films" || tab == "Series") &&
                 (browsingTotal > browsePageSize || browseOffset > 0)) {
@@ -677,7 +789,7 @@ class MainActivity : Activity() {
                 Ui.tvFocus(this)
             }
             val width = if (horizontal) Ui.artworkCardWidth(this@MainActivity) else ViewGroup.LayoutParams.MATCH_PARENT
-            column.layoutParams = RecyclerView.LayoutParams(width, dp(231)).apply {
+            column.layoutParams = RecyclerView.LayoutParams(width, dp(if (isTv) 268 else 231)).apply {
                 leftMargin = dp(5); rightMargin = dp(5); bottomMargin = dp(9)
             }
             val frame = FrameLayout(this@MainActivity).apply {
@@ -688,12 +800,12 @@ class MainActivity : Activity() {
             frame.addView(Ui.text(this@MainActivity, "▶", 27f, 0xDDF5F6FC.toInt(), true).apply {
                 gravity = Gravity.CENTER
             }, FrameLayout.LayoutParams(-1, -1))
-            column.addView(frame, LinearLayout.LayoutParams(-1, dp(174)))
-            val name = Ui.text(this@MainActivity, "", 13f, Ui.WHITE, true).apply {
+            column.addView(frame, LinearLayout.LayoutParams(-1, dp(if (isTv) 195 else 174)))
+            val name = Ui.text(this@MainActivity, "", if (isTv) 16f else 13f, Ui.WHITE, true).apply {
                 maxLines = 2; ellipsize = android.text.TextUtils.TruncateAt.END
                 setPadding(dp(3), dp(6), dp(2), 0)
             }
-            val sub = Ui.text(this@MainActivity, "", 10.5f, Ui.MUTED).apply {
+            val sub = Ui.text(this@MainActivity, "", if (isTv) 12.5f else 10.5f, Ui.MUTED).apply {
                 maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.END
                 setPadding(dp(3), 0, dp(2), 0)
             }
@@ -708,6 +820,7 @@ class MainActivity : Activity() {
             holder.sub.text = epgNow ?: e.group
             ImageLoader.into(holder.art, e.image)
             holder.column.setOnClickListener { showDetails(e) }
+            holder.column.contentDescription = "${e.title}, ${e.group}"
             holder.column.setOnLongClickListener {
                 val fav = storage.toggleFavorite(e.id)
                 Toast.makeText(this@MainActivity, if (fav) "Added to My List" else "Removed from My List", Toast.LENGTH_SHORT).show()
@@ -740,7 +853,7 @@ class MainActivity : Activity() {
         dialog.window?.setBackgroundDrawableResource(android.R.color.transparent)
         dialog.show()
         dialog.window?.setBackgroundDrawableResource(android.R.color.transparent)
-        dialog.window?.setLayout((resources.displayMetrics.widthPixels * .92).toInt(), -2)
+        dialog.window?.setLayout((resources.displayMetrics.widthPixels * (if (isTv) .67 else .92)).toInt(), -2)
     }
 
     private fun open(entry: MediaEntry) {
@@ -829,6 +942,7 @@ class MainActivity : Activity() {
         loading = true
         loadingMessage = "Connecting to your live channels"
         loadingDone = 0; loadingTotal = 0
+        importing = SourceService.xtreamFor(config) != null
         errorText = ""
         render()
         worker.execute {
@@ -857,7 +971,9 @@ class MainActivity : Activity() {
             } catch (e: Exception) {
                 main.post {
                     if (isFinishing || isDestroyed || AppData.config != config) return@post
+                    importing = false
                     loading = false
+                    updateProgressViews()
                     errorText = e.message ?: "Failed to connect to the source"
                     render()
                     Toast.makeText(this, "Import failed: ${e.message}", Toast.LENGTH_LONG).show()
@@ -871,13 +987,16 @@ class MainActivity : Activity() {
         loading = true
         loadingMessage = "Resuming unfinished catalogue"
         loadingDone = 0; loadingTotal = 0
+        importing = true
         render()
         worker.execute {
             try { importCompleteLibrary(config) }
             catch (e: Exception) {
                 main.post {
                     if (isFinishing || isDestroyed || AppData.config != config) return@post
+                    importing = false
                     loading = false
+                    updateProgressViews()
                     Toast.makeText(this, "Catalogue retry: ${e.message}", Toast.LENGTH_LONG).show()
                     render()
                 }
@@ -887,20 +1006,28 @@ class MainActivity : Activity() {
 
     private fun importCompleteLibrary(config: ProviderConfig) {
         progressEvents = 0
+        importing = true
+        main.post { updateProgressViews() }
+        var lastPostedAt = 0L
         val outcome = SourceService.importAllVod(config, catalogue, { progress ->
             progressEvents++
-            if (progressEvents % 4 == 0 || progress.done == progress.total ||
-                progress.total > 0 && progressEvents == 1) {
+            val now = android.os.SystemClock.elapsedRealtime()
+            // Throttle UI updates, not downloads. Never reconstruct the grid or
+            // D-pad focus during background progress.
+            if (progressEvents == 1 || now - lastPostedAt >= 400L ||
+                progress.done + progress.failed == progress.total) {
+                lastPostedAt = now
                 main.post {
                     if (isFinishing || isDestroyed || AppData.config != config) return@post
                     loadingDone = progress.done; loadingTotal = progress.total
                     loadingMessage = progress.category
                     loadingFilms = progress.films; loadingShows = progress.series
                     loadingFailures = progress.failed
-                    if (loading) render()
+                    updateProgressViews()
                 }
             }
-        }, isCancelled = { AppData.config != config || Thread.currentThread().isInterrupted })
+        }, isCancelled = { AppData.config != config || Thread.currentThread().isInterrupted },
+           parallelRequests = if (isTv) 3 else 4)
         storage.markFullImportComplete(outcome.done == outcome.total)
         val report = "Full provider import\nFilms: ${outcome.films}\n" +
             "Series: ${outcome.series}\n" +
@@ -914,9 +1041,12 @@ class MainActivity : Activity() {
             loadingDone = outcome.done; loadingTotal = outcome.total
             loadingFilms = outcome.films; loadingShows = outcome.series
             loadingFailures = outcome.failed
+            importing = false
+            val wasLoading = loading
             loading = false
-            category = "All"
-            render()
+            if (wasLoading) category = "All"
+            updateProgressViews()
+            if (wasLoading || tab == "Home" || tab == "Films" || tab == "Series") render()
             if (outcome.failed > 0) Toast.makeText(this,
                 "Some provider categories failed. Reopen the app to retry.", Toast.LENGTH_LONG).show()
         }
