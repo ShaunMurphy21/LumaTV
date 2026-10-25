@@ -18,11 +18,13 @@ import android.view.View
 import android.view.ViewGroup
 import android.view.WindowInsets
 import android.view.inputmethod.InputMethodManager
+import android.widget.ArrayAdapter
 import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
 import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.ListView
 import android.widget.ProgressBar
 import android.widget.ScrollView
 import android.widget.TextView
@@ -373,7 +375,19 @@ class MainActivity : Activity() {
         headingRow.addView(Ui.text(this, heading, 24f, Ui.WHITE, true), LinearLayout.LayoutParams(0, -2, 1f))
         headingRow.addView(Ui.text(this, "${data.size} titles", 12f, Ui.MUTED))
         layout.addView(headingRow)
-        val groups = listOf("All") + data.map { it.group }.distinct().sorted().take(80)
+        if ((tab == "Films" || tab == "Series") &&
+            AppData.config?.kind in setOf("xtream", "m3u")) {
+            val kind = if (tab == "Films") ContentType.MOVIE else ContentType.SERIES
+            layout.addView(Ui.button(this,
+                "Browse ALL provider categories • languages & subtitles", false
+            ) { browseProviderCategories(kind) }, Ui.columnParams(this, 10).apply {
+                leftMargin = dp(16); rightMargin = dp(16)
+            })
+        }
+        val groups = listOf("All") + (
+            listOfNotNull(category.takeIf { it != "All" }) +
+            data.map { it.group }.distinct().sorted().take(79)
+        ).distinct()
         if (groups.size > 1 && search.isBlank()) {
             val chipScroll = HorizontalScrollView(this).apply { isHorizontalScrollBarEnabled = false }
             val chips = Ui.horizontal(this).apply { setPadding(dp(13), 0, dp(13), dp(13)) }
@@ -427,6 +441,131 @@ class MainActivity : Activity() {
             }, LinearLayout.LayoutParams(-1, 0, 1f))
         }
         body.addView(layout, FrameLayout.LayoutParams(-1, -1))
+    }
+
+    private fun browseProviderCategories(type: ContentType) {
+        val config = AppData.config ?: return
+        if (loading) return
+        val busy = AlertDialog.Builder(this)
+            .setTitle("Reading all provider categories")
+            .setMessage("Loading category names only. Your entire library will not be downloaded.")
+            .setNegativeButton("Cancel", null)
+            .create()
+        busy.show()
+        worker.execute {
+            val result = runCatching { SourceService.providerCategories(config, type) }
+            main.post {
+                if (isFinishing || isDestroyed || AppData.config != config || !busy.isShowing) return@post
+                busy.dismiss()
+                result.onSuccess { all -> showProviderCategoryPicker(config, all, type) }
+                    .onFailure { e -> AlertDialog.Builder(this)
+                        .setTitle("Provider categories unavailable")
+                        .setMessage(e.message ?: "Unable to read category names.")
+                        .setPositiveButton("OK", null).show()
+                    }
+            }
+        }
+    }
+
+    /** Filter all provider categories locally. Loading is limited to a selected group. */
+    private fun showProviderCategoryPicker(
+        config: ProviderConfig, categories: List<SourceService.ProviderCategory>, type: ContentType
+    ) {
+        val sorted = categories.sortedBy { it.name.lowercase() }
+        var filtered = sorted
+        val container = Ui.vertical(this).apply { setPadding(dp(16), dp(10), dp(16), dp(4)) }
+        container.addView(Ui.text(this,
+            "${sorted.size} categories available. Search for a language (e.g. EN, English, UK) or subtitle type, then tap a category to load its titles.",
+            13f, Ui.MUTED), Ui.columnParams(this, 12))
+        val filter = EditText(this).apply {
+            hint = "Filter categories, languages or subtitles"
+            setSingleLine(true)
+            setTextColor(Ui.WHITE)
+            setHintTextColor(Ui.MUTED)
+            setPadding(dp(12), dp(12), dp(12), dp(12))
+            background = Ui.bg(Ui.PANEL, dp(12).toFloat())
+        }
+        container.addView(filter, Ui.columnParams(this, 12))
+        val list = ListView(this).apply {
+            isFocusable = true
+            dividerHeight = dp(1)
+        }
+        val labels = mutableListOf<String>()
+        val adapter = object : ArrayAdapter<String>(this, android.R.layout.simple_list_item_1, labels) {
+            override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
+                val row = super.getView(position, convertView, parent)
+                (row as? TextView)?.apply {
+                    setTextColor(Ui.WHITE)
+                    setPadding(dp(12), dp(10), dp(12), dp(10))
+                }
+                return row
+            }
+        }
+        list.adapter = adapter
+        fun display(matches: List<SourceService.ProviderCategory>) {
+            filtered = matches
+            labels.clear()
+            labels.addAll(matches.map { it.name })
+            adapter.notifyDataSetChanged()
+        }
+        display(sorted)
+        filter.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
+                val query = s?.toString().orEmpty().trim()
+                display(if (query.isBlank()) sorted else sorted.filter {
+                    it.name.contains(query, ignoreCase = true)
+                })
+            }
+            override fun afterTextChanged(s: Editable?) {}
+        })
+        container.addView(list, LinearLayout.LayoutParams(-1, dp(if (isTv) 400 else 350)))
+        val picker = AlertDialog.Builder(this)
+            .setTitle(if (type == ContentType.SERIES) "All series categories" else "All film categories")
+            .setView(container)
+            .setNegativeButton("Close", null)
+            .create()
+        list.setOnItemClickListener { _, _, position, _ ->
+            val selected = filtered.getOrNull(position) ?: return@setOnItemClickListener
+            picker.dismiss()
+            loadProviderCategory(config, selected)
+        }
+        picker.show()
+    }
+
+    private fun loadProviderCategory(config: ProviderConfig, selected: SourceService.ProviderCategory) {
+        if (loading) return
+        loading = true
+        errorText = ""
+        render()
+        worker.execute {
+            try {
+                val fetched = SourceService.loadProviderCategory(config, selected)
+                if (AppData.config != config) return@execute
+                val current = AppData.entries
+                val merged = (current + fetched).distinctBy { it.id }
+                storage.saveCatalog(merged)
+                main.post {
+                    if (isFinishing || isDestroyed || AppData.config != config) return@post
+                    AppData.entries = merged
+                    loading = false
+                    tab = if (selected.type == ContentType.SERIES) "Series" else "Films"
+                    category = selected.name
+                    searchBox.hint = searchHint()
+                    clearSearch()
+                    Toast.makeText(this, "Loaded ${fetched.size} titles from ${selected.name}", Toast.LENGTH_LONG).show()
+                }
+            } catch (e: Exception) {
+                main.post {
+                    if (isFinishing || isDestroyed || AppData.config != config) return@post
+                    loading = false
+                    render()
+                    AlertDialog.Builder(this).setTitle("Category could not be loaded")
+                        .setMessage(e.message ?: "Unable to retrieve category contents")
+                        .setPositiveButton("OK", null).show()
+                }
+            }
+        }
     }
 
     private inner class MediaAdapter(private val data: List<MediaEntry>, private val horizontal: Boolean) :
