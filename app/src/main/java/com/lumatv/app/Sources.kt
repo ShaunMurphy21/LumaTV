@@ -241,9 +241,13 @@ object SourceService {
     // retry by category: many provider panels support only category requests.
     private fun fetchCatalogue(
         config: ProviderConfig, action: String, categories: List<JSONObject>,
-        maxCategories: Int = 80
+        maxCategories: Int = 80, skipGlobal: Boolean = false
     ): FetchOutcome {
-        val full = fetchArray(config, action)
+        // Large Xtream providers can stall on unfiltered get_live_streams.
+        // Fetch a few specific categories only when Live is explicitly opened.
+        val full = if (skipGlobal)
+            FetchOutcome(emptyList(), "global Live TV lookup skipped")
+        else fetchArray(config, action)
         if (full.rows.isNotEmpty() || categories.isEmpty() ||
             listOf("HTTP 401", "HTTP 403", "HTTP 429").any { full.note == it }) return full
         val ids = categories.mapNotNull { it.optString("category_id").takeIf(String::isNotBlank) }
@@ -456,14 +460,18 @@ object SourceService {
         return result
     }
 
-    /** A fast, bounded Live TV preview, not an 80-category blocker at startup. */
+    /**
+     * Called only when the user opens Live TV. Avoid the huge global streams
+     * request and don't block browsing Film/Series catalogues on Live TV.
+     */
     fun loadXtreamLive(config: ProviderConfig, onStage: (String) -> Unit = {}): CatalogLoad =
         loadXtream(config, loadLive = true, includeVod = false,
-            liveBootstrapLimit = 3, onStage = onStage)
+            liveBootstrapLimit = 3, skipGlobalLive = true, onStage = onStage)
 
     private fun loadXtream(
         config: ProviderConfig, loadLive: Boolean = true, includeVod: Boolean = true,
-        liveBootstrapLimit: Int = 80, onStage: (String) -> Unit = {}
+        liveBootstrapLimit: Int = 80, skipGlobalLive: Boolean = false,
+        onStage: (String) -> Unit = {}
     ): CatalogLoad {
         require(Net.validHttp(config.url)) { "Enter a full http:// or https:// server address." }
         onStage("Authenticating with Xtream provider")
@@ -490,7 +498,8 @@ object SourceService {
         val p = Net.urlEncode(config.password)
         if (loadLive) onStage("Loading a small Live TV preview")
         val liveResponse = if (loadLive) fetchCatalogue(
-            config, "get_live_streams", liveCategories.rows, liveBootstrapLimit
+            config, "get_live_streams", liveCategories.rows, liveBootstrapLimit,
+            skipGlobal = skipGlobalLive
         ) else FetchOutcome(emptyList(), "skipped")
         val live = liveResponse.rows.mapNotNull { j ->
             val sid = j.optString("stream_id").takeIf { it.isNotBlank() } ?: return@mapNotNull null

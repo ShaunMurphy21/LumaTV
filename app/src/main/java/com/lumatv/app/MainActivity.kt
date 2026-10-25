@@ -61,6 +61,11 @@ class MainActivity : Activity() {
     @Volatile private var cancelImportRequested = false
     private val searchRender = Runnable { if (::body.isInitialized && !isFinishing) render() }
     private val worker = Executors.newSingleThreadExecutor()
+    private val liveWorker = Executors.newSingleThreadExecutor()
+    private var liveLoading = false
+    private var liveFailure = ""
+    private var initialTitlesRendered = false
+    private var liveMessage = "Loading Live TV channels"
     private val main = Handler(Looper.getMainLooper())
     private var tab = "Home"
     private var category = "All"
@@ -146,6 +151,7 @@ class MainActivity : Activity() {
             predictiveBackCallback = null
         }
         worker.shutdownNow()
+        liveWorker.shutdownNow()
         main.removeCallbacks(searchRender)
         super.onDestroy()
     }
@@ -255,6 +261,53 @@ class MainActivity : Activity() {
         clearSearch(false)
         searchBox.hint = searchHint()
         render()
+        if (name == "Live TV") requestLiveChannels()
+    }
+
+    /**
+     * Live TV is completely independent from Films/Series catalogue imports.
+     * If the provider's Live endpoint is slow or huge, the UI remains usable.
+     */
+    private fun requestLiveChannels(force: Boolean = false) {
+        val config = AppData.config ?: return
+        if (config.kind != "xtream" || liveLoading ||
+            (!force && AppData.entries.any { it.type == ContentType.LIVE })) return
+        liveLoading = true
+        liveFailure = ""
+        liveMessage = "Reading Live TV category names"
+        if (tab == "Live TV") render()
+        liveWorker.execute {
+            try {
+                val result = SourceService.loadXtreamLive(config) { stage ->
+                    main.post {
+                        if (!isFinishing && !isDestroyed && AppData.config == config &&
+                            tab == "Live TV") {
+                            liveMessage = stage
+                            render()
+                        }
+                    }
+                }
+                if (AppData.config != config || cancelImportRequested) return@execute
+                val merged = AppData.entries.filter { it.type != ContentType.LIVE } +
+                    result.entries.filter { it.type == ContentType.LIVE }
+                storage.saveCatalog(merged)
+                main.post {
+                    if (isFinishing || isDestroyed || AppData.config != config) return@post
+                    AppData.entries = merged
+                    liveLoading = false
+                    liveFailure = if (result.entries.none { it.type == ContentType.LIVE })
+                        "No channels returned by the provider's first three Live TV categories." else ""
+                    if (tab == "Live TV" || tab == "Home") render()
+                }
+            } catch (_: Exception) {
+                main.post {
+                    if (isFinishing || isDestroyed || AppData.config != config) return@post
+                    liveLoading = false
+                    liveFailure = "The Live TV server request failed. You can retry without losing your Films or Series."
+                    if (tab == "Live TV") render()
+                }
+            }
+        }
     }
 
     private fun updateTvNavigation() {
@@ -345,8 +398,13 @@ class MainActivity : Activity() {
             }
         }
         when {
-AppData.entries.isEmpty() && browsingTotal == 0 &&
-                catalogue.count(ContentType.MOVIE) == 0 && catalogue.count(ContentType.SERIES) == 0 -> showError()
+            importing && AppData.entries.isEmpty() && browsingTotal == 0 &&
+                catalogue.count(ContentType.MOVIE) == 0 && catalogue.count(ContentType.SERIES) == 0 ->
+                showBrowse(emptyList(), "Importing Films & Series")
+            tab == "Live TV" && matches.isEmpty() && liveLoading -> showBrowse(matches, "Live TV")
+            AppData.entries.isEmpty() && browsingTotal == 0 &&
+                catalogue.count(ContentType.MOVIE) == 0 && catalogue.count(ContentType.SERIES) == 0 &&
+                !liveLoading -> showError()
             search.isNotBlank() -> showBrowse(matches, "Search ${tab.lowercase()}")
             tab == "Home" -> showHome(visible)
             else -> showBrowse(matches, tab)
@@ -600,11 +658,28 @@ AppData.entries.isEmpty() && browsingTotal == 0 &&
             else if (category == "All" || search.isNotBlank()) data
             else data.filter { it.group == category }
         if (filtered.isEmpty()) {
+            if (tab == "Live TV" && !liveLoading && AppData.config?.kind == "xtream") {
+                layout.addView(Ui.button(this, "Load / retry Live TV channels", false) {
+                    requestLiveChannels(force = true)
+                }, Ui.columnParams(this, 10).apply {
+                    leftMargin = dp(18); rightMargin = dp(18)
+                })
+            }
             val message = when (tab) {
-                "Films" -> "No films found. Refresh your library in Settings. Your provider must expose VOD films or your M3U must identify film groups."
-                "Series" -> "No series found. Refresh your library in Settings. Xtream needs a series catalogue; M3U needs labelled series episodes."
-                "Live TV" -> "No visible channels. You may have hidden them in Manage channels."
-                else -> "Nothing here yet. Try another category or add a playlist."
+                "Films" -> if (importing)
+                    "Importing films in the background. Categories and film titles will appear as they download."
+                else "No films available. Check catalogue diagnostics or refresh the source."
+                "Series" -> if (importing)
+                    "Importing series in the background. Versions and subtitle editions will appear as categories finish."
+                else "No series available. Check catalogue diagnostics or refresh the source."
+                "Live TV" -> when {
+                    liveLoading -> liveMessage + " — Films and Series can still be used."
+                    liveFailure.isNotBlank() -> liveFailure
+                    else -> "No live channels loaded. Try loading channels or check your channel filters."
+                }
+                else -> if (importing)
+                    "Importing all Films and Series in the background. Select Films or Series to browse available titles."
+                else "Nothing here yet. Try another category or add a playlist."
             }
             layout.addView(Ui.text(this, message, 15f, Ui.MUTED).apply {
                 setPadding(dp(23), dp(35), dp(23), 0)
@@ -938,6 +1013,7 @@ AppData.entries.isEmpty() && browsingTotal == 0 &&
     }
 
     private fun connect(config: ProviderConfig) {
+        cancelImportRequested = true
         storage.clearProvider()
         AppData.config = config
         AppData.entries = emptyList()
@@ -945,6 +1021,9 @@ AppData.entries.isEmpty() && browsingTotal == 0 &&
         AppData.catalogReport = ""
         AppData.episodeQueue = emptyList(); AppData.episodeQueueFor = ""
         storage.saveProvider(config)
+        cancelImportRequested = false
+        liveLoading = false
+        liveFailure = ""
         loadingDone = 0; loadingTotal = 0
         refresh()
     }
@@ -952,9 +1031,40 @@ AppData.entries.isEmpty() && browsingTotal == 0 &&
     private fun refresh() {
         val config = AppData.config ?: return
         if (loading) return
+        if (config.kind == "xtream") {
+            // Xtream category import must NEVER depend on the Live TV endpoint.
+            // Let users navigate immediately, even while all categories download.
+            cancelImportRequested = false
+            loading = false
+            importing = true
+            loadingMessage = "Reading Film and Series categories"
+            loadingDone = 0; loadingTotal = 0
+            initialTitlesRendered = false
+            liveLoading = false
+            errorText = ""
+            storage.markCatalogRefreshed()
+            render()
+            worker.execute {
+                try {
+                    importCompleteLibrary(config)
+                } catch (_: Exception) {
+                    main.post {
+                        if (isFinishing || isDestroyed || AppData.config != config) return@post
+                        importing = false
+                        loading = false
+                        errorText = "The provider's Film/Series catalogue could not be read. Check your server connection and retry in Settings."
+                        updateProgressViews()
+                        render()
+                    }
+                }
+            }
+            // When requested, Live TV will load on its own executor via the Live tab.
+            if (tab == "Live TV") requestLiveChannels()
+            return
+        }
         loading = true
         cancelImportRequested = false
-        loadingMessage = "Connecting to your live channels"
+        loadingMessage = "Connecting to your playlist"
         loadingDone = 0; loadingTotal = 0
         importing = SourceService.xtreamFor(config) != null
         errorText = ""
@@ -1021,6 +1131,7 @@ AppData.entries.isEmpty() && browsingTotal == 0 &&
         loadingDone = 0; loadingTotal = 0
         importing = true
         cancelImportRequested = false
+        initialTitlesRendered = false
         updateProgressViews()
         worker.execute {
             try { importCompleteLibrary(config) }
@@ -1059,6 +1170,11 @@ AppData.entries.isEmpty() && browsingTotal == 0 &&
                     if (loading && (progress.films + progress.series > 0)) {
                         loading = false
                         render()
+                    } else if (!initialTitlesRendered &&
+                        (progress.films + progress.series > 0)) {
+                        // Show the first batch immediately, then preserve focus.
+                        initialTitlesRendered = true
+                        if (tab == "Home" || tab == "Films" || tab == "Series") render()
                     }
                     updateProgressViews()
                 }
