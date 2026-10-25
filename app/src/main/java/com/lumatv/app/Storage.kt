@@ -68,8 +68,8 @@ class Storage(private val context: Context) {
     }
 
     // Force a one-time catalogue refresh when switching from the earlier M3U classifier.
-    fun needsCatalogRefresh(): Boolean = prefs.getInt("catalog_parser_version", 0) < 4
-    fun markCatalogRefreshed() { prefs.edit().putInt("catalog_parser_version", 4).apply() }
+    fun needsCatalogRefresh(): Boolean = prefs.getInt("catalog_parser_version", 0) < 5
+    fun markCatalogRefreshed() { prefs.edit().putInt("catalog_parser_version", 5).apply() }
 
     fun saveCatalogReport(report: String) { prefs.edit().putString("catalog_report", report).apply() }
     fun loadCatalogReport(): String = prefs.getString("catalog_report", "") ?: ""
