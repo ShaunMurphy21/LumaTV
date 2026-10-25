@@ -170,7 +170,7 @@ class MainActivity : Activity() {
     }
 
     private fun showWelcome() {
-        val scroll = ScrollView(this).apply { fillViewport = true }
+        val scroll = ScrollView(this).apply { setFillViewport(true) }
         val column = Ui.vertical(this).apply { setPadding(dp(24), dp(35), dp(24), dp(24)) }
         column.addView(Ui.text(this, "YOUR SCREEN.\nYOUR WORLD.", 35f, Ui.WHITE, true).apply { letterSpacing = .04f })
         column.addView(Ui.text(this, "A beautiful home for your live television, films and series.", 16f, Ui.MUTED).apply {
