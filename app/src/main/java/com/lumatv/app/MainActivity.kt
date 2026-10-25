@@ -64,7 +64,11 @@ class MainActivity : Activity() {
     private var tab = "Home"
     private var category = "All"
     private var search = ""
-    private val isTv by lazy { packageManager.hasSystemFeature("android.software.leanback") }
+    private val isTv by lazy {
+        packageManager.hasSystemFeature("android.software.leanback") ||
+            (getSystemService(UI_MODE_SERVICE) as? android.app.UiModeManager)
+                ?.currentModeType == Configuration.UI_MODE_TYPE_TELEVISION
+    }
     private var predictiveBackCallback: android.window.OnBackInvokedCallback? = null
     private var loading = false
     private var errorText = ""
@@ -201,7 +205,7 @@ class MainActivity : Activity() {
             hint = searchHint()
             setHintTextColor(Ui.MUTED)
             setTextColor(Ui.WHITE)
-            textSize = 14f
+            textSize = if (isTv) 17f else 14f
             isSingleLine = true
             background = Ui.bg(Ui.SURFACE, dp(15).toFloat())
             setPadding(dp(17), dp(12), dp(12), dp(12))
@@ -217,7 +221,9 @@ class MainActivity : Activity() {
                 override fun afterTextChanged(s: Editable?) {}
             })
         }
-        val searchRow = Ui.horizontal(this).apply { setPadding(dp(16), 0, dp(16), dp(11)) }
+        val searchRow = Ui.horizontal(this).apply {
+            setPadding(dp(if (isTv) 36 else 16), 0, dp(if (isTv) 36 else 16), dp(11))
+        }
         searchRow.addView(searchBox, LinearLayout.LayoutParams(0, dp(if (isTv) 55 else 47), 1f))
         searchRow.addView(Ui.button(this, "✕", false) {
             clearSearch()
@@ -525,7 +531,10 @@ AppData.entries.isEmpty() && browsingTotal == 0 &&
             setPadding(dp(12), 0, dp(12), dp(6))
             isNestedScrollingEnabled = false
         }
-        parent.addView(rv, LinearLayout.LayoutParams(-1, dp(239)).apply { bottomMargin = dp(11) })
+        rv.setItemViewCacheSize(if (isTv) 12 else 6)
+        parent.addView(rv, LinearLayout.LayoutParams(-1, dp(if (isTv) 285 else 239)).apply {
+            bottomMargin = dp(11)
+        })
     }
 
     private fun showBrowse(data: List<MediaEntry>, heading: String) {
@@ -559,7 +568,8 @@ AppData.entries.isEmpty() && browsingTotal == 0 &&
                     gravity = Gravity.CENTER
                     background = Ui.bg(if (category == name) Ui.MINT else Ui.PANEL, dp(20).toFloat())
                     setPadding(dp(14), dp(9), dp(14), dp(9))
-                    isClickable = true
+                    isClickable = true; isFocusable = true
+                    if (isTv) Ui.tvFocus(this)
                     setOnClickListener { category = name; browseOffset = 0; render() }
                 }
                 chips.addView(chip, LinearLayout.LayoutParams(-2, -2).apply { rightMargin = dp(8) })
@@ -593,6 +603,8 @@ AppData.entries.isEmpty() && browsingTotal == 0 &&
             }
         } else {
             val span = when {
+                isTv && resources.configuration.screenWidthDp >= 1050 -> 6
+                isTv -> 5
                 resources.configuration.screenWidthDp >= 840 -> 5
                 resources.configuration.screenWidthDp >= 600 -> 4
                 resources.configuration.screenWidthDp >= 385 -> 3
@@ -601,8 +613,10 @@ AppData.entries.isEmpty() && browsingTotal == 0 &&
             layout.addView(RecyclerView(this).apply {
                 layoutManager = GridLayoutManager(this@MainActivity, span)
                 adapter = MediaAdapter(filtered, horizontal = false)
-                setPadding(dp(9), 0, dp(9), dp(20))
+                setPadding(dp(if (isTv) 28 else 9), dp(6), dp(if (isTv) 28 else 9), dp(20))
                 clipToPadding = false
+                setItemViewCacheSize(if (isTv) 16 else 6)
+                descendantFocusability = ViewGroup.FOCUS_AFTER_DESCENDANTS
             }, LinearLayout.LayoutParams(-1, 0, 1f))
             if ((tab == "Films" || tab == "Series") &&
                 (browsingTotal > browsePageSize || browseOffset > 0)) {
@@ -768,7 +782,7 @@ AppData.entries.isEmpty() && browsingTotal == 0 &&
                 Ui.tvFocus(this)
             }
             val width = if (horizontal) Ui.artworkCardWidth(this@MainActivity) else ViewGroup.LayoutParams.MATCH_PARENT
-            column.layoutParams = RecyclerView.LayoutParams(width, dp(231)).apply {
+            column.layoutParams = RecyclerView.LayoutParams(width, dp(if (isTv) 268 else 231)).apply {
                 leftMargin = dp(5); rightMargin = dp(5); bottomMargin = dp(9)
             }
             val frame = FrameLayout(this@MainActivity).apply {
@@ -779,12 +793,12 @@ AppData.entries.isEmpty() && browsingTotal == 0 &&
             frame.addView(Ui.text(this@MainActivity, "▶", 27f, 0xDDF5F6FC.toInt(), true).apply {
                 gravity = Gravity.CENTER
             }, FrameLayout.LayoutParams(-1, -1))
-            column.addView(frame, LinearLayout.LayoutParams(-1, dp(174)))
-            val name = Ui.text(this@MainActivity, "", 13f, Ui.WHITE, true).apply {
+            column.addView(frame, LinearLayout.LayoutParams(-1, dp(if (isTv) 195 else 174)))
+            val name = Ui.text(this@MainActivity, "", if (isTv) 16f else 13f, Ui.WHITE, true).apply {
                 maxLines = 2; ellipsize = android.text.TextUtils.TruncateAt.END
                 setPadding(dp(3), dp(6), dp(2), 0)
             }
-            val sub = Ui.text(this@MainActivity, "", 10.5f, Ui.MUTED).apply {
+            val sub = Ui.text(this@MainActivity, "", if (isTv) 12.5f else 10.5f, Ui.MUTED).apply {
                 maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.END
                 setPadding(dp(3), 0, dp(2), 0)
             }
@@ -799,6 +813,7 @@ AppData.entries.isEmpty() && browsingTotal == 0 &&
             holder.sub.text = epgNow ?: e.group
             ImageLoader.into(holder.art, e.image)
             holder.column.setOnClickListener { showDetails(e) }
+            holder.column.contentDescription = "${e.title}, ${e.group}"
             holder.column.setOnLongClickListener {
                 val fav = storage.toggleFavorite(e.id)
                 Toast.makeText(this@MainActivity, if (fav) "Added to My List" else "Removed from My List", Toast.LENGTH_SHORT).show()
@@ -831,7 +846,7 @@ AppData.entries.isEmpty() && browsingTotal == 0 &&
         dialog.window?.setBackgroundDrawableResource(android.R.color.transparent)
         dialog.show()
         dialog.window?.setBackgroundDrawableResource(android.R.color.transparent)
-        dialog.window?.setLayout((resources.displayMetrics.widthPixels * .92).toInt(), -2)
+        dialog.window?.setLayout((resources.displayMetrics.widthPixels * (if (isTv) .67 else .92)).toInt(), -2)
     }
 
     private fun open(entry: MediaEntry) {
