@@ -133,7 +133,6 @@ class MainActivity : Activity() {
         }
         worker.shutdownNow()
         main.removeCallbacks(searchRender)
-        catalogue.close()
         super.onDestroy()
     }
 
@@ -376,39 +375,37 @@ AppData.entries.isEmpty() && browsingTotal == 0 &&
     private fun showLoading() {
         val shell = Ui.vertical(this).apply {
             gravity = Gravity.CENTER
-            setPadding(dp(22), dp(18), dp(22), dp(18))
+            setPadding(dp(if (isTv) 75 else 22), dp(18), dp(if (isTv) 75 else 22), dp(18))
         }
-        shell.addView(Ui.text(this, "Building your IPTV library", 24f, Ui.WHITE, true).apply {
+        shell.addView(Ui.text(this, "BUILDING YOUR LIBRARY",
+            if (isTv) 29f else 24f, Ui.WHITE, true).apply {
             gravity = Gravity.CENTER
-        }, Ui.columnParams(this, 18))
-        shell.addView(Ui.text(this, loadingMessage, 15f, Ui.MINT, true).apply {
-            gravity = Gravity.CENTER
-            maxLines = 2
-        }, Ui.columnParams(this, 16))
-        val indicator = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
-            max = if (loadingTotal > 0) loadingTotal else 100
-            progress = if (loadingTotal > 0) loadingDone.coerceIn(0, loadingTotal) else 0
-            isIndeterminate = loadingTotal == 0
+        }, Ui.columnParams(this, if (isTv) 20 else 16))
+        progressHeadline = Ui.text(this, loadingMessage,
+            if (isTv) 19f else 15f, Ui.MINT, true).apply {
+            gravity = Gravity.CENTER; maxLines = 2
         }
-        shell.addView(indicator, LinearLayout.LayoutParams(-1, dp(14)))
-        val fraction = if (loadingTotal > 0) "$loadingDone / $loadingTotal categories" else "Connecting…"
-        shell.addView(Ui.text(this, fraction, 16f, Ui.WHITE, true).apply {
+        shell.addView(progressHeadline, Ui.columnParams(this, 12))
+        progressBarView = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal)
+        shell.addView(progressBarView, LinearLayout.LayoutParams(-1, dp(16)))
+        progressCounter = Ui.text(this, "", if (isTv) 19f else 16f, Ui.WHITE, true).apply {
             gravity = Gravity.CENTER
-        }, Ui.columnParams(this, 14))
-        if (loadingTotal > 0) {
-            shell.addView(Ui.text(this,
-                "Films: $loadingFilms     Series: $loadingShows     Failed: $loadingFailures",
-                13f, Ui.MUTED).apply { gravity = Gravity.CENTER }, Ui.columnParams(this, 15))
-            shell.addView(Ui.text(this,
-                "Importing all provider categories into device storage. Already completed categories are skipped after reopening the app.",
-                12f, Ui.MUTED).apply { gravity = Gravity.CENTER },
-                Ui.columnParams(this, 16))
-            shell.addView(Ui.button(this, "Browse downloaded titles", false) {
-                loading = false
-                render()
-            })
         }
+        shell.addView(progressCounter, Ui.columnParams(this, 12))
+        progressSubtitle = Ui.text(this, "", if (isTv) 15f else 13f, Ui.MUTED).apply {
+            gravity = Gravity.CENTER
+        }
+        shell.addView(progressSubtitle, Ui.columnParams(this, 12))
+        shell.addView(Ui.text(this, "Downloading in parallel • saved by category • safe to resume",
+            12f, Ui.MUTED).apply { gravity = Gravity.CENTER }, Ui.columnParams(this, 14))
+        shell.addView(Ui.button(this, "Browse what's ready  ▶", false) {
+            loading = false
+            progressBarView = null; progressHeadline = null
+            progressCounter = null; progressSubtitle = null
+            selectTab(if (loadingShows > 0) "Series" else if (loadingFilms > 0) "Films" else "Live TV")
+        }, Ui.columnParams(this, 8))
         body.addView(shell, FrameLayout.LayoutParams(-1, -1))
+        updateProgressViews()
     }
 
     private fun showWelcome() {
@@ -923,6 +920,7 @@ AppData.entries.isEmpty() && browsingTotal == 0 &&
         loading = true
         loadingMessage = "Connecting to your live channels"
         loadingDone = 0; loadingTotal = 0
+        importing = SourceService.xtreamFor(config) != null
         errorText = ""
         render()
         worker.execute {
@@ -951,7 +949,9 @@ AppData.entries.isEmpty() && browsingTotal == 0 &&
             } catch (e: Exception) {
                 main.post {
                     if (isFinishing || isDestroyed || AppData.config != config) return@post
+                    importing = false
                     loading = false
+                    updateProgressViews()
                     errorText = e.message ?: "Failed to connect to the source"
                     render()
                     Toast.makeText(this, "Import failed: ${e.message}", Toast.LENGTH_LONG).show()
@@ -965,13 +965,16 @@ AppData.entries.isEmpty() && browsingTotal == 0 &&
         loading = true
         loadingMessage = "Resuming unfinished catalogue"
         loadingDone = 0; loadingTotal = 0
+        importing = true
         render()
         worker.execute {
             try { importCompleteLibrary(config) }
             catch (e: Exception) {
                 main.post {
                     if (isFinishing || isDestroyed || AppData.config != config) return@post
+                    importing = false
                     loading = false
+                    updateProgressViews()
                     Toast.makeText(this, "Catalogue retry: ${e.message}", Toast.LENGTH_LONG).show()
                     render()
                 }
@@ -981,20 +984,28 @@ AppData.entries.isEmpty() && browsingTotal == 0 &&
 
     private fun importCompleteLibrary(config: ProviderConfig) {
         progressEvents = 0
+        importing = true
+        main.post { updateProgressViews() }
+        var lastPostedAt = 0L
         val outcome = SourceService.importAllVod(config, catalogue, { progress ->
             progressEvents++
-            if (progressEvents % 4 == 0 || progress.done == progress.total ||
-                progress.total > 0 && progressEvents == 1) {
+            val now = android.os.SystemClock.elapsedRealtime()
+            // Throttle UI updates, not downloads. Never reconstruct the grid or
+            // D-pad focus during background progress.
+            if (progressEvents == 1 || now - lastPostedAt >= 400L ||
+                progress.done + progress.failed == progress.total) {
+                lastPostedAt = now
                 main.post {
                     if (isFinishing || isDestroyed || AppData.config != config) return@post
                     loadingDone = progress.done; loadingTotal = progress.total
                     loadingMessage = progress.category
                     loadingFilms = progress.films; loadingShows = progress.series
                     loadingFailures = progress.failed
-                    if (loading) render()
+                    updateProgressViews()
                 }
             }
-        }, isCancelled = { AppData.config != config || Thread.currentThread().isInterrupted })
+        }, isCancelled = { AppData.config != config || Thread.currentThread().isInterrupted },
+           parallelRequests = if (isTv) 3 else 4)
         storage.markFullImportComplete(outcome.done == outcome.total)
         val report = "Full provider import\nFilms: ${outcome.films}\n" +
             "Series: ${outcome.series}\n" +
@@ -1008,9 +1019,12 @@ AppData.entries.isEmpty() && browsingTotal == 0 &&
             loadingDone = outcome.done; loadingTotal = outcome.total
             loadingFilms = outcome.films; loadingShows = outcome.series
             loadingFailures = outcome.failed
+            importing = false
+            val wasLoading = loading
             loading = false
-            category = "All"
-            render()
+            if (wasLoading) category = "All"
+            updateProgressViews()
+            if (wasLoading || tab == "Home" || tab == "Films" || tab == "Series") render()
             if (outcome.failed > 0) Toast.makeText(this,
                 "Some provider categories failed. Reopen the app to retry.", Toast.LENGTH_LONG).show()
         }
