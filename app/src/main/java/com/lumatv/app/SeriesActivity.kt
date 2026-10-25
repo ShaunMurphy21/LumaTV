@@ -77,12 +77,16 @@ class SeriesActivity : Activity() {
         // Keep different language and subtitle editions as distinct playable
         // series, while making it easy to switch between versions of a show.
         val key = SeriesVariants.canonicalTitle(show.title)
-        val versions = AppData.entries.asSequence()
+        val provider = AppData.config?.let { SourceService.xtreamFor(it) }
+        val onDisk = if (provider != null)
+            CatalogDatabase(this).use { it.matchingSeries(provider, key) }
+            else emptyList()
+        val versions = (AppData.entries.asSequence()
             .filter { it.type == ContentType.SERIES && SeriesVariants.canonicalTitle(it.title) == key }
+            .take(60).toList() + onDisk + show)
             .distinctBy { it.id }
-            .take(60)
             .sortedWith(compareBy({ it.title.lowercase() }, { it.group.lowercase() }))
-            .toList()
+            .take(60)
         if (versions.size > 1) {
             about.addView(Ui.text(this, "Available languages & editions (${versions.size})",
                 15f, Ui.MINT, true), Ui.columnParams(this, 10))
