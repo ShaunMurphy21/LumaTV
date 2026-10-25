@@ -3,49 +3,62 @@ package com.lumatv.app
 import java.util.Locale
 
 /**
- * An edition is not interchangeable with another just because it belongs to
- * the same programme. Keep the display title intact, including language tags.
+ * Preserve each series edition's original language/subtitle label.
+ * Canonical names are used only to display related editions together.
  */
 object SeriesVariants {
-    private val tag = Regex("""(?i)(?:EN|ENG|ENGLISH|FR|FRA|FRENCH|DE|DEU|GER|GERMAN|ES|ESP|SPANISH|IT|ITA|ITALIAN|PT|POR|PORTUGUESE|NL|DUTCH|PL|POLISH|TR|TURKISH|AR|ARABIC|RU|RUSSIAN|UK|US|JP|JPN|JAPANESE|KR|KOR|KOREAN|HI|HINDI|VOSTFR|MULTI|DUAL(?:[ -]?AUDIO)?|SUB(?:S|BED|TITLED)?|DUB(?:S|BED)?|CC|HEVC|HDR|4K|UHD|FHD|HD|1080P|720P|[A-Z]{2}(?:[ -]?(?:SUBS?|DUB(?:BED)?|CC)))(?:[ +/,&-]+(?:EN|ENG|FR|FRA|DE|GER|ES|ESP|IT|PT|SUBS?|DUB(?:BED)?|CC|DUAL|VOSTFR|4K|HD|1080P))*)""")
-    private val wrapped = Regex("""^\s*([\[(])([^\])\]]{1,40})([\])])""")
-    private val trailing = Regex("""([\[(])([^\])\]]{1,40})([\])])\s*$""")
-    private val seasonSuffix = Regex("""(?i)^\s*[-:|]?\s*([\[(])([^\])\]]{1,40})([\])])""")
+    private val languageWords = setOf(
+        "EN", "ENG", "ENGLISH", "UK", "US", "FR", "FRA", "FRENCH",
+        "DE", "DEU", "GER", "GERMAN", "ES", "ESP", "SPANISH",
+        "IT", "ITA", "ITALIAN", "PT", "POR", "PORTUGUESE",
+        "NL", "DUTCH", "PL", "POLISH", "TR", "TURKISH",
+        "AR", "ARABIC", "RU", "RUSSIAN", "JP", "JPN", "JAPANESE",
+        "KR", "KOR", "KOREAN", "HI", "HINDI", "VOSTFR", "MULTI",
+        "DUAL", "AUDIO", "SUB", "SUBS", "SUBBED", "SUBTITLED",
+        "DUB", "DUBS", "DUBBED", "CC", "HEVC", "HDR", "4K",
+        "UHD", "FHD", "HD", "1080P", "720P"
+    )
+    private val leading = Regex("""^\s*(?:\(|\[)([^)\]]{1,40})(?:\)|\])""")
+    private val trailing = Regex("""(?:\(|\[)([^)\]]{1,40})(?:\)|\])\s*$""")
+    private val afterEpisode = Regex("""^\s*[-:|]?\s*(?:\(|\[)([^)\]]{1,40})(?:\)|\])""")
+    private val splitTokens = Regex("""[\s+/,&|\-_]+""")
     private val whitespace = Regex("""\s+""")
 
     private fun isEditionLabel(value: String): Boolean {
-        val token = value.trim()
-        return token.isNotEmpty() && tag.matches(token)
+        val words = value.uppercase(Locale.ROOT).trim().split(splitTokens)
+            .filter(String::isNotBlank)
+        return words.isNotEmpty() && words.size <= 6 && words.all { it in languageWords }
     }
 
-    /** Keep [EN] / (French Subs) after S01E02, but never add the episode name. */
+    /** Keep [EN] or (French Subs) after S01E02; exclude episode-specific titles. */
     fun episodeSeriesTitle(fullTitle: String, episodeStart: Int, episodeEndExclusive: Int): String {
         val base = fullTitle.substring(0, episodeStart).trim().trimEnd('-', ':', '.', ' ')
             .ifBlank { fullTitle }
         var suffix = fullTitle.substring(episodeEndExclusive)
-        val labels = mutableListOf<String>()
+        val editionTags = mutableListOf<String>()
         repeat(3) {
-            val match = seasonSuffix.find(suffix) ?: return@repeat
-            if (match.range.first != 0 || !isEditionLabel(match.groupValues[2])) return@repeat
-            labels.add(match.groupValues[0].trim().trimStart('-', ':', '|', ' '))
-            suffix = suffix.substring(match.range.last + 1)
+            val match = afterEpisode.find(suffix)
+            if (match != null && match.range.first == 0 && isEditionLabel(match.groupValues[1])) {
+                editionTags.add(match.value.trim().trimStart('-', ':', '|', ' '))
+                suffix = suffix.substring(match.range.last + 1)
+            }
         }
-        return (listOf(base) + labels).joinToString(" ").trim()
+        return (listOf(base) + editionTags).joinToString(" ").trim()
     }
 
-    /** Group editions for navigation while never merging their actual MediaEntry IDs. */
+    /** Only group titles for the language selector; never merge their entries. */
     fun canonicalTitle(title: String): String {
-        var clean = title.trim()
+        var value = title.trim()
         repeat(4) {
-            val prefix = wrapped.find(clean)
-            if (prefix != null && isEditionLabel(prefix.groupValues[2])) {
-                clean = clean.substring(prefix.range.last + 1).trimStart(' ', '-', ':', '|')
+            val first = leading.find(value)
+            if (first != null && isEditionLabel(first.groupValues[1])) {
+                value = value.substring(first.range.last + 1).trimStart(' ', '-', ':', '|')
             }
-            val suffix = trailing.find(clean)
-            if (suffix != null && isEditionLabel(suffix.groupValues[2])) {
-                clean = clean.substring(0, suffix.range.first).trimEnd(' ', '-', ':', '|')
+            val last = trailing.find(value)
+            if (last != null && isEditionLabel(last.groupValues[1])) {
+                value = value.substring(0, last.range.first).trimEnd(' ', '-', ':', '|')
             }
         }
-        return clean.lowercase(Locale.ROOT).replace(whitespace, " ").trim()
+        return value.lowercase(Locale.ROOT).replace(whitespace, " ").trim()
     }
 }
