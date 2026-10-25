@@ -51,6 +51,14 @@ class MainActivity : Activity() {
     private lateinit var body: FrameLayout
     private lateinit var searchBox: EditText
     private lateinit var footer: LinearLayout
+    private val tvNavigation = linkedMapOf<String, TextView>()
+    private var progressBarView: ProgressBar? = null
+    private var progressHeadline: TextView? = null
+    private var progressCounter: TextView? = null
+    private var progressSubtitle: TextView? = null
+    private var syncingLabel: TextView? = null
+    private var importing = false
+    private val searchRender = Runnable { if (::body.isInitialized && !isFinishing) render() }
     private val worker = Executors.newSingleThreadExecutor()
     private val main = Handler(Looper.getMainLooper())
     private var tab = "Home"
@@ -124,6 +132,8 @@ class MainActivity : Activity() {
             predictiveBackCallback = null
         }
         worker.shutdownNow()
+        main.removeCallbacks(searchRender)
+        catalogue.close()
         super.onDestroy()
     }
 
@@ -151,7 +161,42 @@ class MainActivity : Activity() {
         header.addView(Ui.button(this, "⚙", false) { showSettings() }.apply {
             textSize = 21f; setPadding(dp(15), dp(7), dp(15), dp(7))
         })
+        if (isTv) {
+            syncingLabel = Ui.text(this, "", 13f, Ui.MINT, true).apply {
+                isFocusable = true
+                isClickable = true
+                setPadding(dp(12), dp(8), dp(12), dp(8))
+                setOnClickListener {
+                    if (importing) {
+                        loading = true
+                        render()
+                    }
+                }
+            }
+            header.addView(syncingLabel)
+        }
         root.addView(header)
+        tvNavigation.clear()
+        if (isTv) {
+            val nav = Ui.horizontal(this).apply {
+                setPadding(dp(24), dp(4), dp(24), dp(12))
+            }
+            val labels = listOf("Home", "Live TV", "Films", "Series", "My List")
+            labels.forEach { name ->
+                val button = Ui.text(this, name, 17f, Ui.WHITE, true).apply {
+                    gravity = Gravity.CENTER
+                    setPadding(dp(25), dp(13), dp(25), dp(13))
+                    isFocusable = true; isClickable = true
+                    setOnClickListener { selectTab(name) }
+                    setOnFocusChangeListener { _, _ -> updateTvNavigation() }
+                }
+                tvNavigation[name] = button
+                nav.addView(button, LinearLayout.LayoutParams(0, dp(50), 1f).apply {
+                    leftMargin = dp(5); rightMargin = dp(5)
+                })
+            }
+            root.addView(nav)
+        }
 
         searchBox = EditText(this).apply {
             hint = searchHint()
@@ -167,7 +212,8 @@ class MainActivity : Activity() {
                 override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
                     search = s?.toString().orEmpty()
                     browseOffset = 0
-                    if (::body.isInitialized) render()
+                    main.removeCallbacks(searchRender)
+                    main.postDelayed(searchRender, if (isTv) 280 else 220)
                 }
                 override fun afterTextChanged(s: Editable?) {}
             })
@@ -184,30 +230,79 @@ class MainActivity : Activity() {
             setPadding(dp(8), dp(8), dp(8), dp(10))
             setBackgroundColor(0xFF10131E.toInt())
         }
-        root.addView(footer)
+        if (!isTv) root.addView(footer)
+    }
+
+    private fun selectTab(name: String) {
+        tab = name
+        category = "All"
+        browseOffset = 0
+        clearSearch(false)
+        searchBox.hint = searchHint()
+        render()
+    }
+
+    private fun updateTvNavigation() {
+        tvNavigation.forEach { (name, button) ->
+            val focused = button.isFocused
+            val selected = name == tab
+            button.background = Ui.bg(
+                if (focused) Ui.MINT else if (selected) Ui.PANEL else Ui.BG,
+                dp(12).toFloat(), if (focused) Ui.WHITE else null
+            )
+            button.setTextColor(if (focused) Ui.BG else if (selected) Ui.MINT else Ui.WHITE)
+        }
+    }
+
+    private fun updateProgressViews() {
+        progressHeadline?.text = loadingMessage
+        progressBarView?.apply {
+            isIndeterminate = loadingTotal <= 0
+            max = loadingTotal.coerceAtLeast(1)
+            progress = (loadingDone + loadingFailures).coerceAtMost(max)
+        }
+        progressCounter?.text = if (loadingTotal > 0)
+            "${(loadingDone + loadingFailures).coerceAtMost(loadingTotal)} of $loadingTotal categories processed"
+        else "Connecting…"
+        progressSubtitle?.text =
+            "Films: $loadingFilms    Series: $loadingShows    Failed: $loadingFailures"
+        syncingLabel?.apply {
+            text = if (importing && loadingTotal > 0)
+                "Syncing ${(loadingDone + loadingFailures).coerceAtMost(loadingTotal)}/$loadingTotal"
+            else if (importing) "Syncing catalogue…" else ""
+            visibility = if (importing) View.VISIBLE else View.GONE
+        }
     }
 
     private fun render() {
         if (!::body.isInitialized) return
         body.removeAllViews()
-        footer.removeAllViews()
-        val tabs = listOf("Home" to "⌂", "Live TV" to "▣", "Films" to "▶", "Series" to "▤", "My List" to "♥")
-        tabs.forEach { (name, symbol) ->
-            val selected = tab == name
-            val column = Ui.vertical(this).apply {
-                gravity = Gravity.CENTER; setPadding(1, dp(2), 1, dp(2)); isClickable = true
-                isFocusable = true
-                background = Ui.bg(if (selected) Ui.PANEL else 0xFF10131E.toInt(), dp(9).toFloat())
-                Ui.tvFocus(this)
-                setOnClickListener {
-                    tab = name; category = "All"; browseOffset = 0
-                    clearSearch(); searchBox.hint = searchHint(); render()
+        if (isTv) {
+            updateTvNavigation()
+        } else {
+            footer.removeAllViews()
+            val tabs = listOf("Home" to "⌂", "Live TV" to "▣", "Films" to "▶", "Series" to "▤", "My List" to "♥")
+            tabs.forEach { (name, symbol) ->
+                val selected = tab == name
+                val column = Ui.vertical(this).apply {
+                    gravity = Gravity.CENTER
+                    setPadding(1, dp(2), 1, dp(2))
+                    isClickable = true; isFocusable = true
+                    background = Ui.bg(if (selected) Ui.PANEL else 0xFF10131E.toInt(), dp(9).toFloat())
+                    Ui.tvFocus(this)
+                    setOnClickListener { selectTab(name) }
                 }
+                column.addView(Ui.text(this, symbol, 19f, if (selected) Ui.MINT else Ui.MUTED, selected).apply {
+                    gravity = Gravity.CENTER
+                })
+                column.addView(Ui.text(this, name, 10f, if (selected) Ui.WHITE else Ui.MUTED, selected).apply {
+                    gravity = Gravity.CENTER
+                })
+                footer.addView(column, LinearLayout.LayoutParams(0, dp(54), 1f))
             }
-            column.addView(Ui.text(this, symbol, if (isTv) 23f else 19f, if (selected) Ui.MINT else Ui.MUTED, selected).apply { gravity = Gravity.CENTER })
-            column.addView(Ui.text(this, name, if (isTv) 15f else 10f, if (selected) Ui.WHITE else Ui.MUTED, selected).apply { gravity = Gravity.CENTER })
-            footer.addView(column, LinearLayout.LayoutParams(0, dp(if (isTv) 70 else 54), 1f))
         }
+        if (loading) { showLoading(); return }
+        if (AppData.config == null) { showWelcome(); return }
         val visible = storage.visibleEntries(AppData.entries).filter { it.type != ContentType.EPISODE }
         val vodType = if (SourceService.xtreamFor(AppData.config ?: ProviderConfig("", "", "")) != null)
             when (tab) {
@@ -235,9 +330,7 @@ class MainActivity : Activity() {
             }
         }
         when {
-            loading -> showLoading()
-            AppData.config == null -> showWelcome()
-            AppData.entries.isEmpty() && browsingTotal == 0 &&
+AppData.entries.isEmpty() && browsingTotal == 0 &&
                 catalogue.count(ContentType.MOVIE) == 0 && catalogue.count(ContentType.SERIES) == 0 -> showError()
             search.isNotBlank() -> showBrowse(matches, "Search ${tab.lowercase()}")
             tab == "Home" -> showHome(visible)
@@ -253,7 +346,7 @@ class MainActivity : Activity() {
         else -> "⌕   Search all titles"
     }
 
-    private fun clearSearch() {
+    private fun clearSearch(redraw: Boolean = true) {
         search = ""
         if (::searchBox.isInitialized) {
             if (searchBox.text.isNotEmpty()) searchBox.setText("")
@@ -261,14 +354,15 @@ class MainActivity : Activity() {
             (getSystemService(INPUT_METHOD_SERVICE) as? InputMethodManager)
                 ?.hideSoftInputFromWindow(searchBox.windowToken, 0)
         }
-        if (::body.isInitialized) render()
+        main.removeCallbacks(searchRender)
+        if (redraw && ::body.isInitialized) render()
     }
 
     private fun consumeBackNavigation(): Boolean {
         when {
             search.isNotBlank() -> clearSearch()
             category != "All" -> { category = "All"; render() }
-            tab != "Home" -> { tab = "Home"; searchBox.hint = searchHint(); render() }
+            tab != "Home" -> { selectTab("Home"); tvNavigation["Home"]?.requestFocus() }
             else -> return false
         }
         return true
