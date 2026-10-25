@@ -143,6 +143,12 @@ object SourceService {
         return (series.values + entries).distinctBy { it.id }
     }
 
+    fun xtreamFor(provider: ProviderConfig): ProviderConfig? = when (provider.kind) {
+        "xtream" -> provider
+        "m3u" -> xtreamFromM3u(provider)
+        else -> null
+    }
+
     private fun xtreamFromM3u(provider: ProviderConfig): ProviderConfig? {
         if (provider.kind != "m3u" || !Net.validHttp(provider.url)) return null
         val uri = Uri.parse(provider.url)
@@ -301,7 +307,8 @@ object SourceService {
         require(type == ContentType.SERIES || type == ContentType.MOVIE)
         val action = if (type == ContentType.SERIES) "get_series" else "get_vod_streams"
         val response = fetchArray(config, action, category.id)
-        if (response.rows.isEmpty()) error("No titles loaded from ${category.name} (${response.note}).")
+        if (response.rows.isEmpty() && response.note != "0 returned")
+            error("No titles loaded from ${category.name} (${response.note}).")
         val base = config.url.trimEnd('/')
         val user = Net.urlEncode(config.username)
         val pass = Net.urlEncode(config.password)
@@ -333,14 +340,65 @@ object SourceService {
         }
     }
 
-    private fun loadXtream(config: ProviderConfig, loadLive: Boolean = true): CatalogLoad {
+    data class ImportProgress(
+        val done: Int, val total: Int, val category: String,
+        val films: Int, val series: Int, val failed: Int
+    )
+
+    /**
+     * Fetch every available Film/Series category, committing each batch to
+     * SQLite. An interrupted or failed category is retried on next launch.
+     */
+    fun importAllVod(
+        provider: ProviderConfig,
+        database: CatalogDatabase,
+        onProgress: (ImportProgress) -> Unit,
+        isCancelled: () -> Boolean = { false }
+    ): ImportProgress {
+        val config = xtreamFor(provider) ?: error("Xtream credentials required for VOD import")
+        val movies = providerCategories(config, ContentType.MOVIE)
+        val series = providerCategories(config, ContentType.SERIES)
+        val all = movies + series
+        var completed = all.count { database.isComplete(it.type, it.id) }
+        var failed = 0
+        var films = database.count(ContentType.MOVIE)
+        var shows = database.count(ContentType.SERIES)
+        onProgress(ImportProgress(completed, all.size, "Checking provider categories", films, shows, failed))
+        for (cat in all) {
+            if (isCancelled() || Thread.currentThread().isInterrupted) break
+            if (database.isComplete(cat.type, cat.id)) continue
+            try {
+                database.storeCategory(cat, loadProviderCategory(config, cat))
+                completed++
+            } catch (error: Exception) {
+                failed++
+                Log.w("LumaTV", "Category unavailable: ${safeFailure(error)}")
+            }
+            // Only count the changed content type, keeping memory bounded.
+            if (cat.type == ContentType.MOVIE) films = database.count(ContentType.MOVIE)
+            else shows = database.count(ContentType.SERIES)
+            onProgress(ImportProgress(completed, all.size, cat.name, films, shows, failed))
+        }
+        val result = ImportProgress(completed, all.size,
+            if (completed == all.size) "All categories loaded" else "Incomplete categories can be retried",
+            films, shows, failed)
+        onProgress(result)
+        return result
+    }
+
+    fun loadXtreamLive(config: ProviderConfig): CatalogLoad =
+        loadXtream(config, loadLive = true, includeVod = false)
+
+    private fun loadXtream(
+        config: ProviderConfig, loadLive: Boolean = true, includeVod: Boolean = true
+    ): CatalogLoad {
         require(Net.validHttp(config.url)) { "Enter a full http:// or https:// server address." }
         val status = JSONObject(Net.readText(api(config), 1_000_000))
         val auth = status.optJSONObject("user_info") ?: error("The server did not return valid account information.")
         if (auth.optString("auth") != "1") error("The provider rejected the login details.")
         val liveCategories = if (loadLive) fetchArray(config, "get_live_categories") else FetchOutcome(emptyList(), "skipped")
-        val movieCategories = fetchArray(config, "get_vod_categories")
-        val seriesCategories = fetchArray(config, "get_series_categories")
+        val movieCategories = if (includeVod) fetchArray(config, "get_vod_categories") else FetchOutcome(emptyList(), "deferred")
+        val seriesCategories = if (includeVod) fetchArray(config, "get_series_categories") else FetchOutcome(emptyList(), "deferred")
         val liveGroups = liveCategories.rows.associate {
             it.optString("category_id") to it.optString("category_name", "Live TV")
         }
@@ -368,7 +426,8 @@ object SourceService {
             )
         }
         val liveNote = liveResponse.note
-        val movieResponse = fetchCatalogue(config, "get_vod_streams", movieCategories.rows)
+        val movieResponse = if (includeVod) fetchCatalogue(config, "get_vod_streams", movieCategories.rows)
+            else FetchOutcome(emptyList(), "downloading by category")
         val vod = movieResponse.rows.mapNotNull { j ->
             val sid = j.optString("stream_id").takeIf { it.isNotBlank() } ?: return@mapNotNull null
             val ext = j.optString("container_extension", "mp4").let {
@@ -384,7 +443,8 @@ object SourceService {
             )
         }
         val movieNote = movieResponse.note
-        val seriesResponse = fetchCatalogue(config, "get_series", seriesCategories.rows)
+        val seriesResponse = if (includeVod) fetchCatalogue(config, "get_series", seriesCategories.rows)
+            else FetchOutcome(emptyList(), "downloading by category")
         val shows = seriesResponse.rows.mapNotNull { j ->
             val sid = j.optString("series_id").takeIf { it.isNotBlank() } ?: return@mapNotNull null
             MediaEntry(
