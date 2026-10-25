@@ -299,6 +299,33 @@ object SourceService {
             (if (processed < categories.size) " (preview only; full on-disk import follows)" else ""))
     }
 
+    private fun checkXtreamLogin(config: ProviderConfig) {
+        require(Net.validHttp(config.url)) { "Invalid Xtream server address. Check its http:// or https:// prefix." }
+        val response = try {
+            JSONObject(Net.readText(api(config), 350_000))
+        } catch (e: Exception) {
+            error("Cannot connect to Xtream API: ${safeFailure(e)}. Check server address, network and provider status.")
+        }
+        val account = response.optJSONObject("user_info")
+            ?: error("Xtream server did not return account information (unsupported response).")
+        when (account.optString("auth")) {
+            "1", "true" -> Unit
+            else -> error("Xtream login rejected. Check the username and password in Settings.")
+        }
+    }
+
+    /** No URLs, credentials, raw HTTP bodies or provider secrets in user diagnostics. */
+    fun importErrorMessage(error: Exception): String {
+        val message = error.message.orEmpty()
+        return if (message.startsWith("Cannot connect to Xtream API:") ||
+            message.startsWith("Xtream server did not return") ||
+            message.startsWith("Xtream login rejected.") ||
+            message.startsWith("No provider categories received") ||
+            message.startsWith("Both Films and Series catalogues are unavailable")) {
+            message.take(350)
+        } else "Cannot read provider catalogue: ${safeFailure(error)}. Check the connection and retry."
+    }
+
     data class ProviderCategory(val id: String, val name: String, val type: ContentType)
 
     /** Retrieve ALL category names, not only the first 80 used for preview import. */
@@ -386,10 +413,20 @@ object SourceService {
         parallelRequests: Int = 3
     ): ImportProgress {
         val config = xtreamFor(provider) ?: error("Xtream credentials required for VOD import")
+        onProgress(ImportProgress(0, 0, "Checking Xtream login", 0, 0, 0))
+        checkXtreamLogin(config)
         onProgress(ImportProgress(0, 0, "Reading film categories", 0, 0, 0))
-        val movies = providerCategories(config, ContentType.MOVIE)
+        val movieResult = runCatching { providerCategories(config, ContentType.MOVIE) }
         onProgress(ImportProgress(0, 0, "Reading series categories", 0, 0, 0))
-        val series = providerCategories(config, ContentType.SERIES)
+        val seriesResult = runCatching { providerCategories(config, ContentType.SERIES) }
+        if (movieResult.isFailure && seriesResult.isFailure) {
+            val movieCause = movieResult.exceptionOrNull() as? Exception ?: Exception()
+            val seriesCause = seriesResult.exceptionOrNull() as? Exception ?: Exception()
+            error("Both Films and Series catalogues are unavailable. Films: " +
+                "${importErrorMessage(movieCause)}. Series: ${importErrorMessage(seriesCause)}.")
+        }
+        val movies = movieResult.getOrDefault(emptyList())
+        val series = seriesResult.getOrDefault(emptyList())
         // Mix films and series so both libraries become usable early.
         val all = ArrayList<ProviderCategory>(movies.size + series.size)
         repeat(maxOf(movies.size, series.size)) { i ->
@@ -402,10 +439,13 @@ object SourceService {
             if (database.isComplete(it.type, it.id)) completed++
             else pending.add(it)
         }
-        var failures = 0
+        var failures = (if (movieResult.isFailure) 1 else 0) +
+            (if (seriesResult.isFailure) 1 else 0)
         var films = database.count(ContentType.MOVIE)
         var shows = database.count(ContentType.SERIES)
-        onProgress(ImportProgress(completed, all.size, "Reading provider categories", films, shows, 0))
+        onProgress(ImportProgress(completed, all.size,
+            if (failures > 0) "One media type is unavailable; importing the other" else "Importing all categories",
+            films, shows, failures))
         if (pending.isEmpty()) {
             return ImportProgress(completed, all.size, "Already up to date", films, shows, 0)
         }
