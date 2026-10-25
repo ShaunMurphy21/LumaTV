@@ -58,6 +58,7 @@ class MainActivity : Activity() {
     private var progressSubtitle: TextView? = null
     private var syncingLabel: TextView? = null
     private var importing = false
+    @Volatile private var cancelImportRequested = false
     private val searchRender = Runnable { if (::body.isInitialized && !isFinishing) render() }
     private val worker = Executors.newSingleThreadExecutor()
     private val main = Handler(Looper.getMainLooper())
@@ -106,7 +107,9 @@ class MainActivity : Activity() {
                 main.post {
                     if (isFinishing || isDestroyed || AppData.config != provider) return@post
                     loading = false
-                    if (cached.isEmpty()) {
+                    val hasSavedVod = catalogue.count(ContentType.MOVIE) > 0 ||
+                        catalogue.count(ContentType.SERIES) > 0
+                    if (cached.isEmpty() && !hasSavedVod) {
                         refresh()
                     } else {
                         AppData.entries = cached
@@ -171,7 +174,7 @@ class MainActivity : Activity() {
         header.addView(Ui.button(this, "⚙", false) { showSettings() }.apply {
             textSize = 21f; setPadding(dp(15), dp(7), dp(15), dp(7))
         })
-        if (isTv) {
+        run {
             syncingLabel = Ui.text(this, "", 13f, Ui.MINT, true).apply {
                 isFocusable = true
                 isClickable = true
@@ -417,6 +420,16 @@ AppData.entries.isEmpty() && browsingTotal == 0 &&
             progressCounter = null; progressSubtitle = null
             selectTab(if (loadingShows > 0) "Series" else if (loadingFilms > 0) "Films" else "Live TV")
         }, Ui.columnParams(this, 8))
+        shell.addView(Ui.button(this, "Cancel connection / import", false) {
+            cancelImportRequested = true
+            importing = false
+            loading = false
+            progressBarView = null; progressHeadline = null
+            progressCounter = null; progressSubtitle = null
+            loadingMessage = "Import paused"
+            errorText = "The import was stopped. Your saved library is still available. Use Settings → Refresh library to retry."
+            render()
+        }, Ui.columnParams(this, 10))
         body.addView(shell, FrameLayout.LayoutParams(-1, -1))
         updateProgressViews()
     }
@@ -940,6 +953,7 @@ AppData.entries.isEmpty() && browsingTotal == 0 &&
         val config = AppData.config ?: return
         if (loading) return
         loading = true
+        cancelImportRequested = false
         loadingMessage = "Connecting to your live channels"
         loadingDone = 0; loadingTotal = 0
         importing = SourceService.xtreamFor(config) != null
@@ -949,15 +963,31 @@ AppData.entries.isEmpty() && browsingTotal == 0 &&
             try {
                 // Bootstrap Live TV without importing and duplicating 80 categories of VOD.
                 val result = if (config.kind == "xtream")
-                    SourceService.loadXtreamLive(config) else SourceService.loadDetailed(this, config)
-                if (AppData.config != config) return@execute
+                    SourceService.loadXtreamLive(config) { stage ->
+                        main.post {
+                            if (!isFinishing && !isDestroyed && AppData.config == config) {
+                                loadingMessage = stage
+                                updateProgressViews()
+                            }
+                        }
+                    } else SourceService.loadDetailed(this, config)
+                if (AppData.config != config || cancelImportRequested) return@execute
                 storage.saveCatalog(result.entries)
                 storage.saveCatalogReport(result.report)
                 storage.markCatalogRefreshed()
                 AppData.entries = result.entries
                 AppData.catalogReport = result.report
                 if (SourceService.xtreamFor(config) != null) {
-                    // The full import runs on the existing background worker.
+                    // Users can browse the Live TV preview immediately. Keep
+                    // downloading all remaining VOD categories behind the UI.
+                    if (result.entries.isNotEmpty()) {
+                        main.post {
+                            if (!isFinishing && !isDestroyed && AppData.config == config) {
+                                loading = false
+                                render()
+                            }
+                        }
+                    }
                     importCompleteLibrary(config)
                 } else {
                     main.post {
@@ -984,11 +1014,14 @@ AppData.entries.isEmpty() && browsingTotal == 0 &&
 
     private fun resumeFullImport(config: ProviderConfig) {
         if (loading) return
-        loading = true
+        // The last update trapped returning users behind an all-screen spinner
+        // whenever an import was incomplete. Keep the existing library usable.
+        loading = false
         loadingMessage = "Resuming unfinished catalogue"
         loadingDone = 0; loadingTotal = 0
         importing = true
-        render()
+        cancelImportRequested = false
+        updateProgressViews()
         worker.execute {
             try { importCompleteLibrary(config) }
             catch (e: Exception) {
@@ -1023,10 +1056,15 @@ AppData.entries.isEmpty() && browsingTotal == 0 &&
                     loadingMessage = progress.category
                     loadingFilms = progress.films; loadingShows = progress.series
                     loadingFailures = progress.failed
+                    if (loading && (progress.films + progress.series > 0)) {
+                        loading = false
+                        render()
+                    }
                     updateProgressViews()
                 }
             }
-        }, isCancelled = { AppData.config != config || Thread.currentThread().isInterrupted },
+        }, isCancelled = { cancelImportRequested || AppData.config != config ||
+            Thread.currentThread().isInterrupted },
            parallelRequests = if (isTv) 3 else 4)
         storage.markFullImportComplete(outcome.done == outcome.total)
         val report = "Full provider import\nFilms: ${outcome.films}\n" +

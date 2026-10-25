@@ -11,6 +11,7 @@ import java.io.InputStreamReader
 import java.util.concurrent.Callable
 import java.util.concurrent.ExecutorCompletionService
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 object SourceService {
     fun epgUrl(config: ProviderConfig): String {
@@ -239,13 +240,14 @@ object SourceService {
     // If the global VOD/series response is empty, too large or unsupported,
     // retry by category: many provider panels support only category requests.
     private fun fetchCatalogue(
-        config: ProviderConfig, action: String, categories: List<JSONObject>
+        config: ProviderConfig, action: String, categories: List<JSONObject>,
+        maxCategories: Int = 80
     ): FetchOutcome {
         val full = fetchArray(config, action)
         if (full.rows.isNotEmpty() || categories.isEmpty() ||
             listOf("HTTP 401", "HTTP 403", "HTTP 429").any { full.note == it }) return full
         val ids = categories.mapNotNull { it.optString("category_id").takeIf(String::isNotBlank) }
-            .distinct().take(80)
+            .distinct().take(maxCategories)
         if (ids.isEmpty()) return full
 
         // The live-TV bootstrap previously waited for 80 serial HTTP calls.
@@ -380,7 +382,9 @@ object SourceService {
         parallelRequests: Int = 3
     ): ImportProgress {
         val config = xtreamFor(provider) ?: error("Xtream credentials required for VOD import")
+        onProgress(ImportProgress(0, 0, "Reading film categories", 0, 0, 0))
         val movies = providerCategories(config, ContentType.MOVIE)
+        onProgress(ImportProgress(0, 0, "Reading series categories", 0, 0, 0))
         val series = providerCategories(config, ContentType.SERIES)
         // Mix films and series so both libraries become usable early.
         val all = ArrayList<ProviderCategory>(movies.size + series.size)
@@ -417,7 +421,14 @@ object SourceService {
                     })
                     running++
                 }
-                val (category, fetched) = completionQueue.take().get()
+                val finished = completionQueue.poll(10, TimeUnit.SECONDS)
+                if (finished == null) {
+                    onProgress(ImportProgress(completed, all.size,
+                        "Waiting for provider response (downloads still active)",
+                        films, shows, failures))
+                    continue
+                }
+                val (category, fetched) = finished.get()
                 running--
                 fetched.fold(
                     onSuccess = { items ->
@@ -445,16 +456,21 @@ object SourceService {
         return result
     }
 
-    fun loadXtreamLive(config: ProviderConfig): CatalogLoad =
-        loadXtream(config, loadLive = true, includeVod = false)
+    /** A fast, bounded Live TV preview, not an 80-category blocker at startup. */
+    fun loadXtreamLive(config: ProviderConfig, onStage: (String) -> Unit = {}): CatalogLoad =
+        loadXtream(config, loadLive = true, includeVod = false,
+            liveBootstrapLimit = 3, onStage = onStage)
 
     private fun loadXtream(
-        config: ProviderConfig, loadLive: Boolean = true, includeVod: Boolean = true
+        config: ProviderConfig, loadLive: Boolean = true, includeVod: Boolean = true,
+        liveBootstrapLimit: Int = 80, onStage: (String) -> Unit = {}
     ): CatalogLoad {
         require(Net.validHttp(config.url)) { "Enter a full http:// or https:// server address." }
+        onStage("Authenticating with Xtream provider")
         val status = JSONObject(Net.readText(api(config), 1_000_000))
         val auth = status.optJSONObject("user_info") ?: error("The server did not return valid account information.")
         if (auth.optString("auth") != "1") error("The provider rejected the login details.")
+        if (loadLive) onStage("Reading Live TV category names")
         val liveCategories = if (loadLive) fetchArray(config, "get_live_categories") else FetchOutcome(emptyList(), "skipped")
         val movieCategories = if (includeVod) fetchArray(config, "get_vod_categories") else FetchOutcome(emptyList(), "deferred")
         val seriesCategories = if (includeVod) fetchArray(config, "get_series_categories") else FetchOutcome(emptyList(), "deferred")
@@ -472,8 +488,10 @@ object SourceService {
         val base = config.url.trimEnd('/')
         val u = Net.urlEncode(config.username)
         val p = Net.urlEncode(config.password)
-        val liveResponse = if (loadLive) fetchCatalogue(config, "get_live_streams", liveCategories.rows)
-            else FetchOutcome(emptyList(), "skipped")
+        if (loadLive) onStage("Loading a small Live TV preview")
+        val liveResponse = if (loadLive) fetchCatalogue(
+            config, "get_live_streams", liveCategories.rows, liveBootstrapLimit
+        ) else FetchOutcome(emptyList(), "skipped")
         val live = liveResponse.rows.mapNotNull { j ->
             val sid = j.optString("stream_id").takeIf { it.isNotBlank() } ?: return@mapNotNull null
             val extension = if (config.liveFormat == "ts") "ts" else "m3u8"
@@ -517,7 +535,12 @@ object SourceService {
         }
         val seriesNote = seriesResponse.note
         val all = live + vod + shows
-        if (all.isEmpty() && loadLive) error("The provider returned no playable media. Check the provider login and Source diagnostics.")
+        // A provider may expose VOD/series while its global Live API is oversized.
+        // Never reject valid credentials simply because the startup live preview
+        // found no channels; the complete VOD import follows independently.
+        if (all.isEmpty() && loadLive && includeVod) {
+            error("The provider returned no playable media. Check its Live / Films / Series APIs.")
+        }
         return CatalogLoad(all, "Xtream catalogue\n" +
             "Live TV: ${live.size} (${liveNote})\n" +
             "Films: ${vod.size} (${movieNote})\n" +
