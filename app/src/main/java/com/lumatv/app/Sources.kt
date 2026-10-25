@@ -242,30 +242,45 @@ object SourceService {
         config: ProviderConfig, action: String, categories: List<JSONObject>
     ): FetchOutcome {
         val full = fetchArray(config, action)
-        // An explicit auth/rate-limit rejection is not fixed by retrying 80 categories.
         if (full.rows.isNotEmpty() || categories.isEmpty() ||
             listOf("HTTP 401", "HTTP 403", "HTTP 429").any { full.note == it }) return full
         val ids = categories.mapNotNull { it.optString("category_id").takeIf(String::isNotBlank) }
             .distinct().take(80)
         if (ids.isEmpty()) return full
+
+        // The live-TV bootstrap previously waited for 80 serial HTTP calls.
+        // Keep at most three requests in flight to improve load time without
+        // overwhelming a low-memory Fire TV Stick or the IPTV provider.
+        val pool = Executors.newFixedThreadPool(3)
+        val queue = ExecutorCompletionService<FetchOutcome>(pool)
         val recovered = ArrayList<JSONObject>()
         var succeeded = 0
-        var failed = 0
-        var attempted = 0
-        val deadline = System.nanoTime() + 90_000_000_000L
-        for (id in ids) {
-            if (System.nanoTime() > deadline) break
-            val response = fetchArray(config, action, id)
-            attempted++
-            if (response.note.contains("returned")) succeeded++ else failed++
-            val remaining = MAX_ROWS_ACROSS_CATEGORIES - recovered.size
-            if (remaining <= 0) break
-            recovered.addAll(response.rows.take(remaining))
-            if (recovered.size >= MAX_ROWS_ACROSS_CATEGORIES ||
-                listOf("HTTP 401", "HTTP 403", "HTTP 429").any { response.note == it }) break
+        var failures = 0
+        var next = 0
+        var active = 0
+        var processed = 0
+        val deadline = System.nanoTime() + 120_000_000_000L
+        try {
+            while ((next < ids.size || active > 0) && System.nanoTime() < deadline) {
+                if (Thread.currentThread().isInterrupted) break
+                while (active < 3 && next < ids.size) {
+                    val categoryId = ids[next++]
+                    queue.submit(Callable { fetchArray(config, action, categoryId) })
+                    active++
+                }
+                val response = queue.take().get()
+                active--
+                processed++
+                if (response.note.contains("returned")) succeeded++ else failures++
+                val space = MAX_ROWS_ACROSS_CATEGORIES - recovered.size
+                if (space <= 0) break
+                recovered.addAll(response.rows.take(space))
+                if (recovered.size >= MAX_ROWS_ACROSS_CATEGORIES ||
+                    listOf("HTTP 401", "HTTP 403", "HTTP 429").any { response.note == it }) break
+            }
+        } finally {
+            pool.shutdownNow()
         }
-        // IDs are not always unique across language editions or vendor panels.
-        // Only collapse exact repetitions of the same edition across category pages.
         val unique = recovered.distinctBy {
             listOf(
                 it.optString("series_id").ifBlank { it.optString("stream_id") },
@@ -273,10 +288,9 @@ object SourceService {
                 it.optString("category_id")
             )
         }
-        return FetchOutcome(unique,
-            "${unique.size} returned from $succeeded/$attempted successful category requests" +
-            (if (unique.isEmpty()) " (global: ${full.note}; category errors: $failed)" else "") +
-            (if (attempted < categories.size) " (preview only: $attempted of ${categories.size} categories; browse all provider categories for other languages)" else ""))
+        return FetchOutcome(unique, "${unique.size} returned from $succeeded/$processed category requests" +
+            (if (failures > 0) " (failed: $failures)" else "") +
+            (if (processed < categories.size) " (preview only; full on-disk import follows)" else ""))
     }
 
     data class ProviderCategory(val id: String, val name: String, val type: ContentType)
