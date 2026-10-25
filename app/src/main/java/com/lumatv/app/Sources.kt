@@ -11,6 +11,7 @@ import java.io.InputStreamReader
 import java.util.concurrent.Callable
 import java.util.concurrent.ExecutorCompletionService
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 object SourceService {
     fun epgUrl(config: ProviderConfig): String {
@@ -381,7 +382,9 @@ object SourceService {
         parallelRequests: Int = 3
     ): ImportProgress {
         val config = xtreamFor(provider) ?: error("Xtream credentials required for VOD import")
+        onProgress(ImportProgress(0, 0, "Reading film categories", 0, 0, 0))
         val movies = providerCategories(config, ContentType.MOVIE)
+        onProgress(ImportProgress(0, 0, "Reading series categories", 0, 0, 0))
         val series = providerCategories(config, ContentType.SERIES)
         // Mix films and series so both libraries become usable early.
         val all = ArrayList<ProviderCategory>(movies.size + series.size)
@@ -418,7 +421,14 @@ object SourceService {
                     })
                     running++
                 }
-                val (category, fetched) = completionQueue.take().get()
+                val finished = completionQueue.poll(10, TimeUnit.SECONDS)
+                if (finished == null) {
+                    onProgress(ImportProgress(completed, all.size,
+                        "Waiting for provider response (downloads still active)",
+                        films, shows, failures))
+                    continue
+                }
+                val (category, fetched) = finished.get()
                 running--
                 fetched.fold(
                     onSuccess = { items ->
