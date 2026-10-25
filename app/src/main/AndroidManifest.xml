@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <application
+        android:allowBackup="false"
+        android:label="LumaTV"
+        android:icon="@drawable/ic_lumatv"
+        android:roundIcon="@drawable/ic_lumatv"
+        android:theme="@style/Theme.LumaTV"
+        android:usesCleartextTraffic="true"
+        android:supportsRtl="true">
+        <activity android:name=".PlayerActivity" android:exported="false"
+            android:supportsPictureInPicture="true"
+            android:configChanges="screenSize|smallestScreenSize|screenLayout|orientation" />
+        <activity android:name=".SeriesActivity" android:exported="false" />
+        <activity android:name=".MainActivity" android:exported="true"
+            android:configChanges="screenSize|smallestScreenSize|orientation">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
