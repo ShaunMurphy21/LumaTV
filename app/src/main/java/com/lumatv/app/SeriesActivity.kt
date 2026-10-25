@@ -74,6 +74,37 @@ class SeriesActivity : Activity() {
         about.addView(Ui.text(this, show.title, 28f, Ui.WHITE, true), Ui.columnParams(this, 6))
         about.addView(Ui.text(this, "SERIES  •  ${show.group}", 12f, Ui.MUTED), Ui.columnParams(this, 11))
         if (show.description.isNotBlank()) about.addView(Ui.text(this, show.description, 14f, Ui.WHITE), Ui.columnParams(this, 17))
+        // Keep different language and subtitle editions as distinct playable
+        // series, while making it easy to switch between versions of a show.
+        val key = SeriesVariants.canonicalTitle(show.title)
+        val versions = AppData.entries.asSequence()
+            .filter { it.type == ContentType.SERIES && SeriesVariants.canonicalTitle(it.title) == key }
+            .distinctBy { it.id }
+            .take(60)
+            .sortedWith(compareBy({ it.title.lowercase() }, { it.group.lowercase() }))
+            .toList()
+        if (versions.size > 1) {
+            about.addView(Ui.text(this, "Available languages & editions (${versions.size})",
+                15f, Ui.MINT, true), Ui.columnParams(this, 10))
+            val versionScroll = HorizontalScrollView(this).apply { isHorizontalScrollBarEnabled = false }
+            val versionButtons = Ui.horizontal(this)
+            versions.forEach { option ->
+                val label = if (versions.count { it.title == option.title } > 1)
+                    "${option.title} • ${option.group}" else option.title
+                versionButtons.addView(Ui.button(this, label, option.id == show.id) {
+                    if (option.id != show.id) {
+                        show = option
+                        episodes = emptyList()
+                        AppData.episodeQueue = emptyList()
+                        AppData.episodeQueueFor = ""
+                        renderHeader()
+                        loadEpisodes()
+                    }
+                }, LinearLayout.LayoutParams(-2, -2).apply { rightMargin = dp(9) })
+            }
+            versionScroll.addView(versionButtons)
+            about.addView(versionScroll, Ui.columnParams(this, 13))
+        }
         about.addView(Ui.button(this, if (storage.isFavorite(show.id)) "♥  In My List" else "♡  Add to My List", false) {
             storage.toggleFavorite(show.id)
             Toast.makeText(this, "My List updated", Toast.LENGTH_SHORT).show()
@@ -89,21 +120,22 @@ class SeriesActivity : Activity() {
         episodeArea.removeAllViews()
         episodeArea.addView(ProgressBar(this).apply { isIndeterminate = true })
         episodeArea.addView(Ui.text(this, "Loading episodes…", 14f, Ui.MUTED), Ui.columnParams(this, 14))
+        val selectedShow = show
         executor.execute {
             try {
                 val config = AppData.config ?: storage.loadProvider() ?: error("Provider no longer connected")
-                val loaded = SourceService.episodes(config, show)
+                val loaded = SourceService.episodes(config, selectedShow)
                 main.post {
-                    if (isFinishing || isDestroyed) return@post
+                    if (isFinishing || isDestroyed || show.id != selectedShow.id) return@post
                     episodes = loaded
-                    AppData.episodeQueueFor = show.seriesId
+                    AppData.episodeQueueFor = selectedShow.seriesId
                     AppData.episodeQueue = loaded
                     chosenSeason = loaded.firstOrNull()?.season ?: 0
                     showEpisodes()
                 }
             } catch (e: Exception) {
                 main.post {
-                    if (isFinishing || isDestroyed) return@post
+                    if (isFinishing || isDestroyed || show.id != selectedShow.id) return@post
                     episodeArea.removeAllViews()
                     episodeArea.addView(Ui.text(this, "Unable to load episodes: ${e.message}", 14f, Ui.MUTED))
                     episodeArea.addView(Ui.button(this, "Try again") { loadEpisodes() }, Ui.columnParams(this, 12))
