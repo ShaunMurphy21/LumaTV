@@ -109,11 +109,11 @@ class MainActivity : Activity() {
             render()
             worker.execute {
                 val cached = storage.loadCatalog()
+                val hasSavedVod = catalogue.count(ContentType.MOVIE) > 0 ||
+                    catalogue.count(ContentType.SERIES) > 0
                 main.post {
                     if (isFinishing || isDestroyed || AppData.config != provider) return@post
                     loading = false
-                    val hasSavedVod = catalogue.count(ContentType.MOVIE) > 0 ||
-                        catalogue.count(ContentType.SERIES) > 0
                     if (cached.isEmpty() && !hasSavedVod) {
                         refresh()
                     } else {
@@ -398,9 +398,11 @@ class MainActivity : Activity() {
             }
         }
         when {
+            // Having no titles is normal while the account is being checked
+            // and categories are being downloaded. This is NOT a login failure.
             importing && AppData.entries.isEmpty() && browsingTotal == 0 &&
                 catalogue.count(ContentType.MOVIE) == 0 && catalogue.count(ContentType.SERIES) == 0 ->
-                showBrowse(emptyList(), "Importing Films & Series")
+                showLoading()
             tab == "Live TV" && matches.isEmpty() && liveLoading -> showBrowse(matches, "Live TV")
             AppData.entries.isEmpty() && browsingTotal == 0 &&
                 catalogue.count(ContentType.MOVIE) == 0 && catalogue.count(ContentType.SERIES) == 0 &&
@@ -1047,12 +1049,12 @@ class MainActivity : Activity() {
             worker.execute {
                 try {
                     importCompleteLibrary(config)
-                } catch (_: Exception) {
+                } catch (error: Exception) {
                     main.post {
                         if (isFinishing || isDestroyed || AppData.config != config) return@post
                         importing = false
                         loading = false
-                        errorText = "The provider's Film/Series catalogue could not be read. Check your server connection and retry in Settings."
+                        errorText = SourceService.importErrorMessage(error)
                         updateProgressViews()
                         render()
                     }
@@ -1140,8 +1142,8 @@ class MainActivity : Activity() {
                     if (isFinishing || isDestroyed || AppData.config != config) return@post
                     importing = false
                     loading = false
+                    errorText = SourceService.importErrorMessage(e)
                     updateProgressViews()
-                    Toast.makeText(this, "Catalogue retry: ${e.message}", Toast.LENGTH_LONG).show()
                     render()
                 }
             }
@@ -1182,7 +1184,8 @@ class MainActivity : Activity() {
         }, isCancelled = { cancelImportRequested || AppData.config != config ||
             Thread.currentThread().isInterrupted },
            parallelRequests = if (isTv) 3 else 4)
-        storage.markFullImportComplete(outcome.done == outcome.total)
+        storage.markFullImportComplete(outcome.total > 0 &&
+            outcome.done == outcome.total && outcome.failed == 0)
         val report = "Full provider import\nFilms: ${outcome.films}\n" +
             "Series: ${outcome.series}\n" +
             "Categories completed: ${outcome.done}/${outcome.total}\n" +
