@@ -59,6 +59,10 @@ class Storage(private val context: Context) {
         return cipher.doFinal(packed.copyOfRange(12, packed.size))
     }
 
+    // Force a one-time catalogue refresh when switching from the earlier M3U classifier.
+    fun needsCatalogRefresh(): Boolean = prefs.getInt("catalog_parser_version", 0) < 2
+    fun markCatalogRefreshed() { prefs.edit().putInt("catalog_parser_version", 2).apply() }
+
     fun saveCatalog(entries: List<MediaEntry>) {
         val array = JSONArray()
         entries.forEach { array.put(it.toJson()) }
@@ -73,6 +77,24 @@ class Storage(private val context: Context) {
         if (!file.exists()) return emptyList()
         JSONArray(String(unseal(file.readBytes()), Charsets.UTF_8)).asObjects().map(MediaEntry::fromJson)
     }.getOrDefault(emptyList())
+
+    // Persist across refreshes and app upgrades. User-managed channel visibility is local to device.
+    fun hiddenChannelIds(): Set<String> = prefs.getStringSet("hidden_channel_ids", emptySet())?.toSet() ?: emptySet()
+    fun isChannelHidden(id: String): Boolean = hiddenChannelIds().contains(id)
+    fun setChannelHidden(id: String, hidden: Boolean) = setHiddenChannels(listOf(id), hidden)
+    fun setHiddenChannels(ids: Collection<String>, hidden: Boolean) {
+        val next = hiddenChannelIds().toMutableSet()
+        if (hidden) next.addAll(ids) else next.removeAll(ids.toSet())
+        prefs.edit().putStringSet("hidden_channel_ids", next).apply()
+    }
+    fun visibleEntries(entries: List<MediaEntry>): List<MediaEntry> {
+        val hidden = hiddenChannelIds()
+        return entries.filter { it.type != ContentType.LIVE || it.id !in hidden }
+    }
+    fun autoplayEnabled(): Boolean = prefs.getBoolean("autoplay_episodes", true)
+    fun setAutoplayEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean("autoplay_episodes", enabled).apply()
+    }
 
     fun isFavorite(id: String): Boolean = prefs.getBoolean("fav_$id", false)
     fun toggleFavorite(id: String): Boolean {

@@ -8,6 +8,7 @@ import android.os.Handler
 import android.os.Looper
 import android.util.Rational
 import android.view.Gravity
+import android.view.KeyEvent
 import android.view.View
 import android.view.WindowManager
 import android.widget.FrameLayout
@@ -32,6 +33,7 @@ class PlayerActivity : Activity() {
     private lateinit var exo: ExoPlayer
     private lateinit var playerView: PlayerView
     private lateinit var toolbar: LinearLayout
+    private lateinit var titleView: TextView
     private lateinit var storage: Storage
     private val handler = Handler(Looper.getMainLooper())
     private var finished = false
@@ -73,10 +75,15 @@ class PlayerActivity : Activity() {
         toolbar.addView(Ui.button(this, "‹", false) { finish() }.apply {
             textSize = 24f; setPadding(dp(13), dp(5), dp(13), dp(5))
         })
-        toolbar.addView(Ui.text(this, entry.title, 15f, Ui.WHITE, true).apply {
+        titleView = Ui.text(this, entry.title, 15f, Ui.WHITE, true).apply {
             maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.END
             setPadding(dp(10), 0, dp(6), 0)
-        }, LinearLayout.LayoutParams(0, -2, 1f))
+        }
+        toolbar.addView(titleView, LinearLayout.LayoutParams(0, -2, 1f))
+        if (entry.type == ContentType.EPISODE) {
+            toolbar.addView(Ui.button(this, "Next ▶", false) { playNextEpisode() },
+                LinearLayout.LayoutParams(-2, -2).apply { rightMargin = dp(7) })
+        }
         toolbar.addView(Ui.button(this, "Fit", false) {
             fillScreen = !fillScreen
             playerView.resizeMode = if (fillScreen) AspectRatioFrameLayout.RESIZE_MODE_ZOOM else AspectRatioFrameLayout.RESIZE_MODE_FIT
@@ -94,6 +101,8 @@ class PlayerActivity : Activity() {
             .setMediaSourceFactory(DefaultMediaSourceFactory(this).setDataSourceFactory(httpSource))
             .build()
         playerView.player = exo
+        playerView.isFocusable = true
+        playerView.requestFocus()
         exo.addListener(object : Player.Listener {
             override fun onPlayerError(error: PlaybackException) {
                 Toast.makeText(this@PlayerActivity,
@@ -102,6 +111,9 @@ class PlayerActivity : Activity() {
             override fun onPlaybackStateChanged(playbackState: Int) {
                 if (playbackState == Player.STATE_ENDED) {
                     storage.savePosition(entry.id, 0L, exo.duration.coerceAtLeast(0L))
+                    if (entry.type == ContentType.EPISODE && storage.autoplayEnabled()) {
+                        playNextEpisode(silent = true)
+                    }
                 }
             }
         })
@@ -114,6 +126,40 @@ class PlayerActivity : Activity() {
         }
         exo.playWhenReady = true
         handler.postDelayed(saveTask, 12_000)
+    }
+
+    private fun playNextEpisode(silent: Boolean = false) {
+        val queue = AppData.episodeQueue.takeIf { AppData.episodeQueueFor == entry.seriesId }
+            ?: emptyList()
+        val current = queue.indexOfFirst { it.id == entry.id }
+        val next = if (current >= 0) queue.getOrNull(current + 1) else null
+        if (next == null) {
+            if (!silent) Toast.makeText(this, "No next episode in this series", Toast.LENGTH_SHORT).show()
+            return
+        }
+        saveProgress()
+        entry = next
+        titleView.text = next.title
+        exo.setMediaItem(MediaItem.fromUri(next.url))
+        exo.prepare()
+        val resume = storage.position(next.id)
+        val duration = storage.duration(next.id)
+        if (resume > 10_000L && (duration <= 0 || resume < duration - 20_000L)) exo.seekTo(resume)
+        exo.playWhenReady = true
+        Toast.makeText(this, "Playing next: ${next.title}", Toast.LENGTH_SHORT).show()
+    }
+
+    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+        if (::exo.isInitialized && (keyCode == KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE ||
+                    keyCode == KeyEvent.KEYCODE_MEDIA_PLAY || keyCode == KeyEvent.KEYCODE_MEDIA_PAUSE)) {
+            when (keyCode) {
+                KeyEvent.KEYCODE_MEDIA_PLAY -> exo.play()
+                KeyEvent.KEYCODE_MEDIA_PAUSE -> exo.pause()
+                else -> if (exo.isPlaying) exo.pause() else exo.play()
+            }
+            return true
+        }
+        return super.onKeyDown(keyCode, event)
     }
 
     private fun pictureInPicture() {

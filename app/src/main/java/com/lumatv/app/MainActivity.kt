@@ -13,6 +13,7 @@ import android.text.Editable
 import android.text.InputType
 import android.text.TextWatcher
 import android.view.Gravity
+import android.view.KeyEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowInsets
@@ -42,6 +43,8 @@ class MainActivity : Activity() {
     private var tab = "Home"
     private var category = "All"
     private var search = ""
+    private val isTv by lazy { packageManager.hasSystemFeature("android.software.leanback") }
+    private var predictiveBackCallback: android.window.OnBackInvokedCallback? = null
     private var loading = false
     private var errorText = ""
 
@@ -51,7 +54,16 @@ class MainActivity : Activity() {
         AppData.config = storage.loadProvider()
         AppData.entries = storage.loadCatalog()
         buildShell()
-        if (AppData.config != null && AppData.entries.isEmpty()) refresh() else {
+        if (android.os.Build.VERSION.SDK_INT >= 33) {
+            predictiveBackCallback = android.window.OnBackInvokedCallback {
+                if (!consumeBackNavigation()) finish()
+            }
+            onBackInvokedDispatcher.registerOnBackInvokedCallback(
+                android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT,
+                predictiveBackCallback!!
+            )
+        }
+        if (AppData.config != null && (AppData.entries.isEmpty() || storage.needsCatalogRefresh())) refresh() else {
             render()
             AppData.config?.let { source ->
                 val guide = SourceService.epgUrl(source)
@@ -72,12 +84,19 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
+        if (android.os.Build.VERSION.SDK_INT >= 33) {
+            predictiveBackCallback?.let { onBackInvokedDispatcher.unregisterOnBackInvokedCallback(it) }
+            predictiveBackCallback = null
+        }
         worker.shutdownNow()
         super.onDestroy()
     }
 
     private fun buildShell() {
-        root = Ui.vertical(this).apply { setBackgroundColor(Ui.BG) }
+        root = Ui.vertical(this).apply {
+            setBackgroundColor(Ui.BG)
+            isFocusableInTouchMode = true // Do not summon the virtual keyboard on TV startup.
+        }
         setContentView(root)
         if (android.os.Build.VERSION.SDK_INT >= 35) {
             root.setOnApplyWindowInsetsListener { _, insets ->
@@ -100,7 +119,7 @@ class MainActivity : Activity() {
         root.addView(header)
 
         searchBox = EditText(this).apply {
-            hint = "⌕   Search channels, films and shows"
+            hint = searchHint()
             setHintTextColor(Ui.MUTED)
             setTextColor(Ui.WHITE)
             textSize = 14f
@@ -117,9 +136,12 @@ class MainActivity : Activity() {
                 override fun afterTextChanged(s: Editable?) {}
             })
         }
-        root.addView(searchBox, LinearLayout.LayoutParams(-1, dp(47)).apply {
-            leftMargin = dp(16); rightMargin = dp(16); bottomMargin = dp(11)
-        })
+        val searchRow = Ui.horizontal(this).apply { setPadding(dp(16), 0, dp(16), dp(11)) }
+        searchRow.addView(searchBox, LinearLayout.LayoutParams(0, dp(if (isTv) 55 else 47), 1f))
+        searchRow.addView(Ui.button(this, "✕", false) {
+            clearSearch()
+        }, LinearLayout.LayoutParams(-2, dp(if (isTv) 55 else 47)).apply { leftMargin = dp(8) })
+        root.addView(searchRow)
         body = FrameLayout(this).apply { setBackgroundColor(Ui.BG) }
         root.addView(body, LinearLayout.LayoutParams(-1, 0, 1f))
         footer = Ui.horizontal(this).apply {
@@ -138,25 +160,70 @@ class MainActivity : Activity() {
             val selected = tab == name
             val column = Ui.vertical(this).apply {
                 gravity = Gravity.CENTER; setPadding(1, dp(2), 1, dp(2)); isClickable = true
-                setOnClickListener { tab = name; category = "All"; render() }
+                isFocusable = true
+                background = Ui.bg(if (selected) Ui.PANEL else 0xFF10131E.toInt(), dp(9).toFloat())
+                Ui.tvFocus(this)
+                setOnClickListener {
+                    tab = name; category = "All"; clearSearch(); searchBox.hint = searchHint(); render()
+                }
             }
-            column.addView(Ui.text(this, symbol, 19f, if (selected) Ui.MINT else Ui.MUTED, selected).apply { gravity = Gravity.CENTER })
-            column.addView(Ui.text(this, name, 10f, if (selected) Ui.WHITE else Ui.MUTED, selected).apply { gravity = Gravity.CENTER })
-            footer.addView(column, LinearLayout.LayoutParams(0, dp(54), 1f))
+            column.addView(Ui.text(this, symbol, if (isTv) 23f else 19f, if (selected) Ui.MINT else Ui.MUTED, selected).apply { gravity = Gravity.CENTER })
+            column.addView(Ui.text(this, name, if (isTv) 15f else 10f, if (selected) Ui.WHITE else Ui.MUTED, selected).apply { gravity = Gravity.CENTER })
+            footer.addView(column, LinearLayout.LayoutParams(0, dp(if (isTv) 70 else 54), 1f))
+        }
+        val visible = storage.visibleEntries(AppData.entries).filter { it.type != ContentType.EPISODE }
+        val scoped = when (tab) {
+            "Live TV" -> visible.filter { it.type == ContentType.LIVE }
+            "Films" -> visible.filter { it.type == ContentType.MOVIE }
+            "Series" -> visible.filter { it.type == ContentType.SERIES }
+            "My List" -> storage.favorites(visible)
+            else -> visible
+        }
+        val matches = if (search.isBlank()) scoped else scoped.filter {
+            it.title.contains(search, ignoreCase = true) || it.group.contains(search, ignoreCase = true)
         }
         when {
             loading -> showLoading()
             AppData.config == null -> showWelcome()
             AppData.entries.isEmpty() -> showError()
-            search.isNotBlank() -> showBrowse(AppData.entries.filter {
-                it.title.contains(search, ignoreCase = true) || it.group.contains(search, ignoreCase = true)
-            }, "Search results")
-            tab == "Home" -> showHome()
-            tab == "Live TV" -> showBrowse(AppData.entries.filter { it.type == ContentType.LIVE }, "Live TV")
-            tab == "Films" -> showBrowse(AppData.entries.filter { it.type == ContentType.MOVIE }, "Films")
-            tab == "Series" -> showBrowse(AppData.entries.filter { it.type == ContentType.SERIES }, "Series")
-            else -> showBrowse(storage.favorites(AppData.entries), "My List")
+            search.isNotBlank() -> showBrowse(matches, "Search ${tab.lowercase()}")
+            tab == "Home" -> showHome(visible)
+            else -> showBrowse(matches, tab)
         }
+    }
+
+    private fun searchHint(): String = when (tab) {
+        "Live TV" -> "⌕   Search live channels"
+        "Films" -> "⌕   Search films only"
+        "Series" -> "⌕   Search series only"
+        "My List" -> "⌕   Search My List"
+        else -> "⌕   Search all titles"
+    }
+
+    private fun clearSearch() {
+        search = ""
+        if (::searchBox.isInitialized) {
+            if (searchBox.text.isNotEmpty()) searchBox.setText("")
+            searchBox.clearFocus()
+            (getSystemService(INPUT_METHOD_SERVICE) as? InputMethodManager)
+                ?.hideSoftInputFromWindow(searchBox.windowToken, 0)
+        }
+        if (::body.isInitialized) render()
+    }
+
+    private fun consumeBackNavigation(): Boolean {
+        when {
+            search.isNotBlank() -> clearSearch()
+            category != "All" -> { category = "All"; render() }
+            tab != "Home" -> { tab = "Home"; searchBox.hint = searchHint(); render() }
+            else -> return false
+        }
+        return true
+    }
+
+    @Deprecated("Legacy back key support for Android and Fire OS")
+    override fun onBackPressed() {
+        if (!consumeBackNavigation()) super.onBackPressed()
     }
 
     private fun showLoading() {
@@ -204,8 +271,8 @@ class MainActivity : Activity() {
         scroll.addView(column); body.addView(scroll)
     }
 
-    private fun showHome() {
-        val list = AppData.entries
+    private fun showHome(list: List<MediaEntry>) {
+        if (list.isEmpty()) { showBrowse(list, "Your library"); return }
         val scroll = ScrollView(this).apply { clipToPadding = false }
         val column = Ui.vertical(this)
         val hero = list.firstOrNull { it.type == ContentType.MOVIE && it.image.isNotBlank() }
@@ -296,7 +363,13 @@ class MainActivity : Activity() {
         }
         val filtered = if (category == "All" || search.isNotBlank()) data else data.filter { it.group == category }
         if (filtered.isEmpty()) {
-            layout.addView(Ui.text(this, "Nothing here yet. Try another category or add a playlist.", 15f, Ui.MUTED).apply {
+            val message = when (tab) {
+                "Films" -> "No films found. Refresh your library in Settings. Your provider must expose VOD films or your M3U must identify film groups."
+                "Series" -> "No series found. Refresh your library in Settings. Xtream needs a series catalogue; M3U needs labelled series episodes."
+                "Live TV" -> "No visible channels. You may have hidden them in Manage channels."
+                else -> "Nothing here yet. Try another category or add a playlist."
+            }
+            layout.addView(Ui.text(this, message, 15f, Ui.MUTED).apply {
                 setPadding(dp(23), dp(35), dp(23), 0)
             })
         } else {
@@ -321,7 +394,11 @@ class MainActivity : Activity() {
         inner class Holder(val column: LinearLayout, val art: ImageView, val name: TextView, val sub: TextView) :
             RecyclerView.ViewHolder(column)
         override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): Holder {
-            val column = Ui.vertical(this@MainActivity)
+            val column = Ui.vertical(this@MainActivity).apply {
+                isClickable = true
+                isFocusable = true
+                Ui.tvFocus(this)
+            }
             val width = if (horizontal) Ui.artworkCardWidth(this@MainActivity) else ViewGroup.LayoutParams.MATCH_PARENT
             column.layoutParams = RecyclerView.LayoutParams(width, dp(231)).apply {
                 leftMargin = dp(5); rightMargin = dp(5); bottomMargin = dp(9)
@@ -462,6 +539,7 @@ class MainActivity : Activity() {
         AppData.config = config
         AppData.entries = emptyList()
         AppData.schedules = emptyMap()
+        AppData.episodeQueue = emptyList(); AppData.episodeQueueFor = ""
         storage.saveProvider(config)
         refresh()
     }
@@ -475,6 +553,7 @@ class MainActivity : Activity() {
                 val entries = SourceService.load(this, config)
                 if (AppData.config != config) return@execute
                 storage.saveCatalog(entries)
+                storage.markCatalogRefreshed()
                 main.post {
                     if (isFinishing || isDestroyed) return@post
                     if (AppData.config != config) return@post
@@ -518,6 +597,15 @@ class MainActivity : Activity() {
         }
         val dialog = AlertDialog.Builder(this).setView(ScrollView(this).apply { addView(panel) }).create()
         if (config != null) {
+            panel.addView(Ui.button(this, "Manage visible channels", false) {
+                dialog.dismiss()
+                startActivity(Intent(this, ChannelManagerActivity::class.java))
+            }, Ui.columnParams(this, 9))
+            panel.addView(Ui.button(this, if (storage.autoplayEnabled()) "Autoplay next episode: ON" else "Autoplay next episode: OFF", false) {
+                storage.setAutoplayEnabled(!storage.autoplayEnabled())
+                dialog.dismiss()
+                showSettings()
+            }, Ui.columnParams(this, 9))
             panel.addView(Ui.button(this, "Save guide URL") {
                 val value = epg?.text?.toString()?.trim().orEmpty()
                 if (value.isNotBlank() && !Net.validHttp(value)) { epg?.error = "Valid URL required"; return@button }
@@ -545,14 +633,16 @@ class MainActivity : Activity() {
         } else {
             panel.addView(Ui.button(this, "Add a source") { dialog.dismiss(); showWelcome() })
         }
-        panel.addView(Ui.text(this, "LumaTV 1.0 • Local playback • No account or tracking", 11f, Ui.MUTED), Ui.columnParams(this, 9))
+        panel.addView(Ui.text(this, "LumaTV 1.1 • Android & Fire TV • Local settings", 11f, Ui.MUTED), Ui.columnParams(this, 9))
         dialog.show()
     }
 
     private fun disconnect() {
         storage.clearProvider()
         AppData.config = null; AppData.entries = emptyList(); AppData.schedules = emptyMap()
+        AppData.episodeQueue = emptyList(); AppData.episodeQueueFor = ""
         tab = "Home"; category = "All"; errorText = ""
+        clearSearch()
         render()
     }
 

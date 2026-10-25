@@ -47,8 +47,22 @@ object Ui {
             gravity = Gravity.CENTER; isClickable = true; isFocusable = true
             background = bg(if (solid) MINT else PANEL, context.dp(14).toFloat())
             setPadding(context.dp(20), context.dp(13), context.dp(20), context.dp(13))
+            setOnFocusChangeListener { view, focused ->
+                view.background = bg(if (focused) ACCENT else if (solid) MINT else PANEL,
+                    context.dp(14).toFloat(), if (focused) WHITE else null)
+                setTextColor(if (focused || solid) BG else WHITE)
+            }
             setOnClickListener { onClick() }
         }
+
+    // D-pad focus rings on cards/navigation for Fire TV and Android TV.
+    fun tvFocus(view: View) {
+        view.setOnFocusChangeListener { v, focused ->
+            v.foreground = if (focused) bg(0x00000000, 12f, WHITE) else null
+            v.scaleX = if (focused) 1.025f else 1f
+            v.scaleY = if (focused) 1.025f else 1f
+        }
+    }
 
     fun vertical(context: Context, gap: Int = 0): LinearLayout = LinearLayout(context).apply {
         orientation = LinearLayout.VERTICAL

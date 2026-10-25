@@ -96,6 +96,8 @@ class SeriesActivity : Activity() {
                 main.post {
                     if (isFinishing || isDestroyed) return@post
                     episodes = loaded
+                    AppData.episodeQueueFor = show.seriesId
+                    AppData.episodeQueue = loaded
                     chosenSeason = loaded.firstOrNull()?.season ?: 0
                     showEpisodes()
                 }
@@ -134,6 +136,8 @@ class SeriesActivity : Activity() {
                 setPadding(dp(9), dp(9), dp(9), dp(9))
                 background = Ui.bg(Ui.SURFACE, dp(12).toFloat())
                 isClickable = true
+                isFocusable = true
+                Ui.tvFocus(this)
                 setOnClickListener {
                     startActivity(Intent(this@SeriesActivity, PlayerActivity::class.java).putExtra("entry", ep.toJson().toString()))
                 }

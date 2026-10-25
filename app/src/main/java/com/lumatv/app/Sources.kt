@@ -2,6 +2,7 @@ package com.lumatv.app
 
 import android.content.Context
 import android.net.Uri
+import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedReader
@@ -40,6 +41,9 @@ object SourceService {
         var sawHeader = false
         val reader = BufferedReader(InputStreamReader(input, Charsets.UTF_8), 64 * 1024)
         var readLines = 0
+        // Common episode notation in IPTV playlists: Title S01E02 / 1x02 / Season 1 Episode 2.
+        val episodePattern = Regex("(?i)\\bS(\\d{1,2})[ ._-]*E(\\d{1,3})\\b|\\b(\\d{1,2})x(\\d{1,3})\\b|\\bSeason[ ._-]*(\\d{1,2})[ ._-]*Episode[ ._-]*(\\d{1,3})\\b")
+        val series = linkedMapOf<String, MediaEntry>()
         reader.forEachLine { raw ->
             readLines++
             if (readLines > 200_000) error("Playlist contains too many lines (limit 200,000).")
@@ -64,21 +68,37 @@ object SourceService {
                     if (entries.size >= 50_000) error("Playlist exceeds the 50,000-item safety limit.")
                     val path = runCatching { Uri.parse(line).path.orEmpty().lowercase() }.getOrDefault("")
                     val lowerGroup = group.lowercase()
+                    val display = title.ifBlank { Uri.parse(line).lastPathSegment.orEmpty().ifBlank { "Untitled" } }
+                    val seriesGroup = "/series/" in path || "series" in lowerGroup || "tv shows" in lowerGroup
+                    val movieGroup = "/movie/" in path || listOf("movie", "film", "vod", "cinema").any { it in lowerGroup }
+                    val episodeMatch = episodePattern.find(display)
                     val type = when {
-                        "/series/" in path || "series" in lowerGroup && !path.endsWith(".m3u8") -> ContentType.MOVIE
-                        "/movie/" in path || path.endsWith(".mp4") || path.endsWith(".mkv") ||
-                            path.endsWith(".avi") || "vod" in lowerGroup || "movie" in lowerGroup -> ContentType.MOVIE
+                        seriesGroup || (episodeMatch != null && !movieGroup) -> ContentType.EPISODE
+                        movieGroup || listOf(".mp4", ".mkv", ".avi", ".mov").any { path.endsWith(it) } -> ContentType.MOVIE
                         else -> ContentType.LIVE
                     }
-                    val display = title.ifBlank { Uri.parse(line).lastPathSegment.orEmpty().ifBlank { "Untitled" } }
-                    entries.add(MediaEntry(makeId(line, display), display, line, type, group, logo, epgId = epgId,
-                        httpUserAgent = agent, httpReferrer = referrer))
+                    if (type == ContentType.EPISODE) {
+                        val name = if (episodeMatch != null) display.substring(0, episodeMatch.range.first)
+                            .trim().trimEnd('-', '.', ':', ' ') .ifBlank { display }
+                            else display
+                        val seriesKey = makeId("playlist-series", group.lowercase(), name.lowercase())
+                        val season = episodeMatch?.let { listOf(1, 3, 5).firstNotNullOfOrNull { n -> it.groups[n]?.value?.toIntOrNull() } } ?: 1
+                        val episode = episodeMatch?.let { listOf(2, 4, 6).firstNotNullOfOrNull { n -> it.groups[n]?.value?.toIntOrNull() } } ?: 1
+                        series.putIfAbsent(seriesKey, MediaEntry(seriesKey, name, type = ContentType.SERIES,
+                            group = group, image = logo, seriesId = seriesKey))
+                        entries.add(MediaEntry(makeId(line, display), display, line, ContentType.EPISODE,
+                            group, logo, epgId = epgId, seriesId = seriesKey, season = season, episode = episode,
+                            httpUserAgent = agent, httpReferrer = referrer))
+                    } else {
+                        entries.add(MediaEntry(makeId(line, display), display, line, type, group, logo, epgId = epgId,
+                            httpUserAgent = agent, httpReferrer = referrer))
+                    }
                     title = ""; logo = ""; epgId = ""; group = "Other"; agent = ""; referrer = ""
                 }
             }
         }
         if (!sawHeader || entries.isEmpty()) error("No playable HTTP/HTTPS items were found in this M3U playlist.")
-        return entries.distinctBy { it.id }
+        return (series.values + entries).distinctBy { it.id }
     }
 
     private fun api(config: ProviderConfig, action: String = "", seriesId: String = ""): String {
@@ -93,7 +113,9 @@ object SourceService {
     }
 
     private fun array(config: ProviderConfig, action: String): List<JSONObject> =
-        JSONArray(Net.readText(api(config, action), 40_000_000)).asObjects()
+        runCatching { JSONArray(Net.readText(api(config, action), 60_000_000)).asObjects() }
+            .onFailure { Log.w("LumaTV", "Xtream endpoint $action unavailable: ${it.message}") }
+            .getOrDefault(emptyList())
 
     private fun loadXtream(config: ProviderConfig): List<MediaEntry> {
         require(Net.validHttp(config.url)) { "Enter a full http:// or https:// server address." }
@@ -149,7 +171,10 @@ object SourceService {
     }
 
     fun episodes(config: ProviderConfig, show: MediaEntry): List<MediaEntry> {
-        require(config.kind == "xtream") { "Series episodes require an Xtream-compatible provider." }
+        if (config.kind != "xtream") {
+            return AppData.entries.filter { it.type == ContentType.EPISODE && it.seriesId == show.seriesId }
+                .sortedWith(compareBy({ it.season }, { it.episode }, { it.title }))
+        }
         val obj = JSONObject(Net.readText(api(config, "get_series_info", show.seriesId), 20_000_000))
         val seasons = obj.optJSONObject("episodes") ?: error("No episodes were returned for this series.")
         val result = mutableListOf<MediaEntry>()
@@ -188,6 +213,13 @@ object SourceService {
             "Animated short film used for playback testing"),
         MediaEntry("demo_dream", "Elephants Dream", "https://storage.googleapis.com/gtv-videos-bucket/sample/ElephantsDream.mp4",
             ContentType.MOVIE, "Sample films", "https://storage.googleapis.com/gtv-videos-bucket/sample/images/ElephantsDream.jpg",
-            "Animated short film used for playback testing")
+            "Animated short film used for playback testing"),
+        // Small test series using publicly published example media to verify autoplay.
+        MediaEntry("demo_series", "Demo Series", type = ContentType.SERIES,
+            group = "Sample series", seriesId = "demo_series"),
+        MediaEntry("demo_episode_1", "Demo Episode 1", "https://storage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4",
+            ContentType.EPISODE, "Demo Series", seriesId = "demo_series", season = 1, episode = 1),
+        MediaEntry("demo_episode_2", "Demo Episode 2", "https://storage.googleapis.com/gtv-videos-bucket/sample/ElephantsDream.mp4",
+            ContentType.EPISODE, "Demo Series", seriesId = "demo_series", season = 1, episode = 2)
     )
 }

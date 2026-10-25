@@ -74,6 +74,9 @@ object AppData {
     @Volatile var entries: List<MediaEntry> = emptyList()
     @Volatile var schedules: Map<String, Schedule> = emptyMap()
     @Volatile var config: ProviderConfig? = null
+    // In-memory ordered episodes supplied by the series screen for uninterrupted playback.
+    @Volatile var episodeQueue: List<MediaEntry> = emptyList()
+    @Volatile var episodeQueueFor: String = ""
     fun find(id: String): MediaEntry? = entries.firstOrNull { it.id == id }
 }
 
