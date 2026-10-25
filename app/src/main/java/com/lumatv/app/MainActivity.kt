@@ -36,6 +36,17 @@ import java.util.concurrent.Executors
 
 class MainActivity : Activity() {
     private lateinit var storage: Storage
+    private val catalogue by lazy { CatalogDatabase(this) }
+    private var browseOffset = 0
+    private val browsePageSize = 180
+    private var browsingTotal = 0
+    private var loadingMessage = "Connecting to your library"
+    private var loadingDone = 0
+    private var loadingTotal = 0
+    private var loadingFilms = 0
+    private var loadingShows = 0
+    private var loadingFailures = 0
+    private var progressEvents = 0
     private lateinit var root: LinearLayout
     private lateinit var body: FrameLayout
     private lateinit var searchBox: EditText
@@ -153,6 +164,7 @@ class MainActivity : Activity() {
                 override fun beforeTextChanged(s: CharSequence?, st: Int, c: Int, a: Int) {}
                 override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
                     search = s?.toString().orEmpty()
+                    browseOffset = 0
                     if (::body.isInitialized) render()
                 }
                 override fun afterTextChanged(s: Editable?) {}
@@ -186,7 +198,8 @@ class MainActivity : Activity() {
                 background = Ui.bg(if (selected) Ui.PANEL else 0xFF10131E.toInt(), dp(9).toFloat())
                 Ui.tvFocus(this)
                 setOnClickListener {
-                    tab = name; category = "All"; clearSearch(); searchBox.hint = searchHint(); render()
+                    tab = name; category = "All"; browseOffset = 0
+                    clearSearch(); searchBox.hint = searchHint(); render()
                 }
             }
             column.addView(Ui.text(this, symbol, if (isTv) 23f else 19f, if (selected) Ui.MINT else Ui.MUTED, selected).apply { gravity = Gravity.CENTER })
@@ -194,6 +207,12 @@ class MainActivity : Activity() {
             footer.addView(column, LinearLayout.LayoutParams(0, dp(if (isTv) 70 else 54), 1f))
         }
         val visible = storage.visibleEntries(AppData.entries).filter { it.type != ContentType.EPISODE }
+        val vodType = if (SourceService.xtreamFor(AppData.config ?: ProviderConfig("", "", "")) != null)
+            when (tab) {
+                "Films" -> ContentType.MOVIE
+                "Series" -> ContentType.SERIES
+                else -> null
+            } else null
         val scoped = when (tab) {
             "Live TV" -> visible.filter { it.type == ContentType.LIVE }
             "Films" -> visible.filter { it.type == ContentType.MOVIE }
@@ -201,13 +220,23 @@ class MainActivity : Activity() {
             "My List" -> storage.favorites(visible)
             else -> visible
         }
-        val matches = if (search.isBlank()) scoped else scoped.filter {
-            it.title.contains(search, ignoreCase = true) || it.group.contains(search, ignoreCase = true)
+        val matches = if (vodType != null && AppData.config != null) {
+            val total = catalogue.count(vodType, search, category)
+            browsingTotal = total
+            if (browseOffset >= total && browseOffset > 0) browseOffset = 0
+            val provider = SourceService.xtreamFor(AppData.config!!)!!
+            catalogue.page(provider, vodType, search, category, browsePageSize, browseOffset)
+        } else {
+            browsingTotal = 0
+            if (search.isBlank()) scoped else scoped.filter {
+                it.title.contains(search, ignoreCase = true) || it.group.contains(search, ignoreCase = true)
+            }
         }
         when {
             loading -> showLoading()
             AppData.config == null -> showWelcome()
-            AppData.entries.isEmpty() -> showError()
+            AppData.entries.isEmpty() && browsingTotal == 0 &&
+                catalogue.count(ContentType.MOVIE) == 0 && catalogue.count(ContentType.SERIES) == 0 -> showError()
             search.isNotBlank() -> showBrowse(matches, "Search ${tab.lowercase()}")
             tab == "Home" -> showHome(visible)
             else -> showBrowse(matches, tab)
@@ -294,7 +323,8 @@ class MainActivity : Activity() {
     }
 
     private fun showHome(list: List<MediaEntry>) {
-        if (list.isEmpty()) { showBrowse(list, "Your library"); return }
+        if (list.isEmpty() && catalogue.count(ContentType.MOVIE) == 0 &&
+            catalogue.count(ContentType.SERIES) == 0) { showBrowse(list, "Your library"); return }
         val scroll = ScrollView(this).apply { clipToPadding = false }
         val column = Ui.vertical(this)
         val hero = list.firstOrNull { it.type == ContentType.MOVIE && it.image.isNotBlank() }
@@ -304,8 +334,12 @@ class MainActivity : Activity() {
         val recents = storage.recents(list)
         if (recents.isNotEmpty()) shelf(column, "Continue watching", recents)
         shelf(column, "Live right now", list.filter { it.type == ContentType.LIVE }.take(25))
-        shelf(column, "Films for you", list.filter { it.type == ContentType.MOVIE }.take(25))
-        val shows = list.filter { it.type == ContentType.SERIES }
+        val xtream = AppData.config?.let { SourceService.xtreamFor(it) }
+        val films = if (xtream != null) catalogue.page(xtream, ContentType.MOVIE, limit = 25)
+            else list.filter { it.type == ContentType.MOVIE }.take(25)
+        shelf(column, "Films for you", films)
+        val shows = if (xtream != null) catalogue.page(xtream, ContentType.SERIES, limit = 25)
+            else list.filter { it.type == ContentType.SERIES }
         shelf(column, "Series to discover", shows.take(25))
         if (shows.size > 25) {
             column.addView(Ui.button(this, "Browse all ${shows.size} series and language editions", false) {
@@ -373,7 +407,9 @@ class MainActivity : Activity() {
         val layout = Ui.vertical(this)
         val headingRow = Ui.horizontal(this).apply { setPadding(dp(16), dp(13), dp(16), dp(14)) }
         headingRow.addView(Ui.text(this, heading, 24f, Ui.WHITE, true), LinearLayout.LayoutParams(0, -2, 1f))
-        headingRow.addView(Ui.text(this, "${data.size} titles", 12f, Ui.MUTED))
+        headingRow.addView(Ui.text(this,
+            if (browsingTotal > 0) "${browsingTotal} titles" else "${data.size} titles",
+            12f, Ui.MUTED))
         layout.addView(headingRow)
         if ((tab == "Films" || tab == "Series") &&
             AppData.config?.kind in setOf("xtream", "m3u")) {
@@ -386,7 +422,9 @@ class MainActivity : Activity() {
         }
         val groups = listOf("All") + (
             listOfNotNull(category.takeIf { it != "All" }) +
-            data.map { it.group }.distinct().sorted().take(79)
+            if (tab == "Films" || tab == "Series") catalogue.categoryNames(
+                if (tab == "Films") ContentType.MOVIE else ContentType.SERIES, 79
+            ) else data.map { it.group }.distinct().sorted().take(79)
         ).distinct()
         if (groups.size > 1 && search.isBlank()) {
             val chipScroll = HorizontalScrollView(this).apply { isHorizontalScrollBarEnabled = false }
@@ -397,13 +435,15 @@ class MainActivity : Activity() {
                     background = Ui.bg(if (category == name) Ui.MINT else Ui.PANEL, dp(20).toFloat())
                     setPadding(dp(14), dp(9), dp(14), dp(9))
                     isClickable = true
-                    setOnClickListener { category = name; render() }
+                    setOnClickListener { category = name; browseOffset = 0; render() }
                 }
                 chips.addView(chip, LinearLayout.LayoutParams(-2, -2).apply { rightMargin = dp(8) })
             }
             chipScroll.addView(chips); layout.addView(chipScroll)
         }
-        val filtered = if (category == "All" || search.isNotBlank()) data else data.filter { it.group == category }
+        val filtered = if (browsingTotal > 0) data
+            else if (category == "All" || search.isNotBlank()) data
+            else data.filter { it.group == category }
         if (filtered.isEmpty()) {
             val message = when (tab) {
                 "Films" -> "No films found. Refresh your library in Settings. Your provider must expose VOD films or your M3U must identify film groups."
@@ -439,6 +479,31 @@ class MainActivity : Activity() {
                 setPadding(dp(9), 0, dp(9), dp(20))
                 clipToPadding = false
             }, LinearLayout.LayoutParams(-1, 0, 1f))
+            if ((tab == "Films" || tab == "Series") &&
+                (browsingTotal > browsePageSize || browseOffset > 0)) {
+                val paging = Ui.horizontal(this).apply {
+                    gravity = Gravity.CENTER
+                    setPadding(dp(12), dp(4), dp(12), dp(5))
+                }
+                if (browseOffset > 0) {
+                    paging.addView(Ui.button(this, "‹ Previous", false) {
+                        browseOffset = (browseOffset - browsePageSize).coerceAtLeast(0)
+                        render()
+                    })
+                }
+                paging.addView(Ui.text(this,
+                    "${browseOffset + 1}–${(browseOffset + filtered.size).coerceAtMost(browsingTotal)} of $browsingTotal",
+                    12f, Ui.MUTED), LinearLayout.LayoutParams(0, -2, 1f).apply {
+                        leftMargin = dp(8)
+                    })
+                if (browseOffset + filtered.size < browsingTotal) {
+                    paging.addView(Ui.button(this, "Next ›", false) {
+                        browseOffset += browsePageSize
+                        render()
+                    })
+                }
+                layout.addView(paging)
+            }
         }
         body.addView(layout, FrameLayout.LayoutParams(-1, -1))
     }
