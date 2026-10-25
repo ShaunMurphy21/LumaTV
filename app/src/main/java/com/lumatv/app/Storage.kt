@@ -68,8 +68,12 @@ class Storage(private val context: Context) {
     }
 
     // Force a one-time catalogue refresh when switching from the earlier M3U classifier.
-    fun needsCatalogRefresh(): Boolean = prefs.getInt("catalog_parser_version", 0) < 5
-    fun markCatalogRefreshed() { prefs.edit().putInt("catalog_parser_version", 5).apply() }
+    fun needsCatalogRefresh(): Boolean = prefs.getInt("catalog_parser_version", 0) < 6
+    fun markCatalogRefreshed() { prefs.edit().putInt("catalog_parser_version", 6).apply() }
+    fun fullImportComplete(): Boolean = prefs.getBoolean("full_xtream_import_complete", false)
+    fun markFullImportComplete(done: Boolean) {
+        prefs.edit().putBoolean("full_xtream_import_complete", done).apply()
+    }
 
     fun saveCatalogReport(report: String) { prefs.edit().putString("catalog_report", report).apply() }
     fun loadCatalogReport(): String = prefs.getString("catalog_report", "") ?: ""
@@ -196,7 +200,9 @@ class Storage(private val context: Context) {
         .take(30)
 
     fun clearProvider() {
-        prefs.edit().remove("provider").remove("catalog_report").apply()
+        prefs.edit().remove("provider").remove("catalog_report")
+            .remove("full_xtream_import_complete").apply()
+        CatalogDatabase(context).use { it.reset() }
         File(context.filesDir, "catalog.enc").delete()
         File(context.filesDir, "catalog.json").delete()
         File(context.filesDir, "catalog.tmp").delete()
