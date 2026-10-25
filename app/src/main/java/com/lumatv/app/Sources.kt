@@ -120,9 +120,9 @@ object SourceService {
                         else -> ContentType.LIVE
                     }
                     if (type == ContentType.EPISODE) {
-                        val name = if (episodeMatch != null) display.substring(0, episodeMatch.range.first)
-                            .trim().trimEnd('-', '.', ':', ' ') .ifBlank { display }
-                            else display
+                        val name = if (episodeMatch != null) SeriesVariants.episodeSeriesTitle(
+                            display, episodeMatch.range.first, episodeMatch.range.last + 1
+                        ) else display
                         val seriesKey = makeId("playlist-series", group.lowercase(), name.lowercase())
                         val season = episodeMatch?.let { listOf(1, 3, 5).firstNotNullOfOrNull { n -> it.groups[n]?.value?.toIntOrNull() } } ?: 1
                         val episode = episodeMatch?.let { listOf(2, 4, 6).firstNotNullOfOrNull { n -> it.groups[n]?.value?.toIntOrNull() } } ?: 1
@@ -251,8 +251,14 @@ object SourceService {
             if (recovered.size >= MAX_ROWS_ACROSS_CATEGORIES ||
                 listOf("HTTP 401", "HTTP 403", "HTTP 429").any { response.note == it }) break
         }
+        // IDs are not always unique across language editions or vendor panels.
+        // Only collapse exact repetitions of the same edition across category pages.
         val unique = recovered.distinctBy {
-            it.optString("stream_id").ifBlank { it.optString("series_id") }
+            listOf(
+                it.optString("series_id").ifBlank { it.optString("stream_id") },
+                it.optString("name").ifBlank { it.optString("title") },
+                it.optString("category_id")
+            )
         }
         return FetchOutcome(unique,
             "${unique.size} returned from $succeeded/$attempted successful category requests" +
@@ -302,7 +308,8 @@ object SourceService {
                 if (it.matches(Regex("[a-zA-Z0-9]{2,5}"))) it else "mp4"
             }
             MediaEntry(
-                id = makeId("movie", base, sid), title = j.optString("name", "Film"),
+                id = makeId("movie", base, sid, j.optString("name"), j.optString("category_id")),
+                title = j.optString("name", "Film"),
                 url = "$base/movie/$u/$p/$sid.$ext", type = ContentType.MOVIE,
                 group = movieGroups[j.optString("category_id")] ?: "Films",
                 image = j.optString("stream_icon").ifBlank { j.optString("cover") },
@@ -314,7 +321,8 @@ object SourceService {
         val shows = seriesResponse.rows.mapNotNull { j ->
             val sid = j.optString("series_id").takeIf { it.isNotBlank() } ?: return@mapNotNull null
             MediaEntry(
-                id = makeId("series", base, sid), title = j.optString("name", "Show"),
+                id = makeId("series", base, sid, j.optString("name"), j.optString("category_id")),
+                title = j.optString("name", "Show"),
                 type = ContentType.SERIES, group = seriesGroups[j.optString("category_id")] ?: "Series",
                 image = j.optString("cover").ifBlank { j.optString("stream_icon") },
                 description = j.optString("plot"), seriesId = sid,
@@ -337,8 +345,11 @@ object SourceService {
         // Shows automatically discovered through an M3U login use Xtream episode APIs too.
         val source = if (config.kind == "xtream") config else {
             val derived = xtreamFromM3u(config)
-            if (derived != null && show.id == makeId("series", derived.url.trimEnd('/'), show.seriesId)) derived
-            else null
+            // Xtream-discovered series have a provider series ID, while
+            // locally grouped M3U series have matching playlist episode rows.
+            if (derived != null && show.seriesId.isNotBlank() &&
+                AppData.entries.none { it.type == ContentType.EPISODE && it.seriesId == show.seriesId }
+            ) derived else null
         }
         if (source == null) {
             return AppData.entries.filter { it.type == ContentType.EPISODE && it.seriesId == show.seriesId }
