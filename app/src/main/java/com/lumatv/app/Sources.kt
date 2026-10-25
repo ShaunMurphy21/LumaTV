@@ -8,6 +8,9 @@ import org.json.JSONObject
 import java.io.BufferedReader
 import java.io.InputStream
 import java.io.InputStreamReader
+import java.util.concurrent.Callable
+import java.util.concurrent.ExecutorCompletionService
+import java.util.concurrent.Executors
 
 object SourceService {
     fun epgUrl(config: ProviderConfig): String {
@@ -201,7 +204,11 @@ object SourceService {
 
     private fun fetchArray(config: ProviderConfig, action: String, categoryId: String = ""): FetchOutcome {
         return try {
-            val maxBytes = if (action.endsWith("_categories")) 2_000_000 else MAX_CATALOGUE_BYTES
+            val maxBytes = when {
+                action.endsWith("_categories") -> 2_000_000
+                categoryId.isNotBlank() -> 4_000_000
+                else -> MAX_CATALOGUE_BYTES
+            }
             val payload = Net.readText(api(config, action, categoryId = categoryId), maxBytes).trim()
             val array = when {
                 payload.startsWith("[") -> JSONArray(payload)
@@ -346,42 +353,80 @@ object SourceService {
     )
 
     /**
-     * Fetch every available Film/Series category, committing each batch to
-     * SQLite. An interrupted or failed category is retried on next launch.
+     * Fetch a bounded number of categories concurrently, while writing their
+     * results on ONE coordinator thread. This avoids both 827 serial HTTP
+     * round trips and the dangerous memory spikes of unlimited parallelism.
+     * Completed category transactions are resumed, not downloaded again.
      */
     fun importAllVod(
         provider: ProviderConfig,
         database: CatalogDatabase,
         onProgress: (ImportProgress) -> Unit,
-        isCancelled: () -> Boolean = { false }
+        isCancelled: () -> Boolean = { false },
+        parallelRequests: Int = 3
     ): ImportProgress {
         val config = xtreamFor(provider) ?: error("Xtream credentials required for VOD import")
         val movies = providerCategories(config, ContentType.MOVIE)
         val series = providerCategories(config, ContentType.SERIES)
-        val all = movies + series
-        var completed = all.count { database.isComplete(it.type, it.id) }
-        var failed = 0
+        // Mix films and series so both libraries become usable early.
+        val all = ArrayList<ProviderCategory>(movies.size + series.size)
+        repeat(maxOf(movies.size, series.size)) { i ->
+            if (i < series.size) all.add(series[i])
+            if (i < movies.size) all.add(movies[i])
+        }
+        var completed = 0
+        val pending = ArrayList<ProviderCategory>()
+        all.forEach {
+            if (database.isComplete(it.type, it.id)) completed++
+            else pending.add(it)
+        }
+        var failures = 0
         var films = database.count(ContentType.MOVIE)
         var shows = database.count(ContentType.SERIES)
-        onProgress(ImportProgress(completed, all.size, "Checking provider categories", films, shows, failed))
-        for (cat in all) {
-            if (isCancelled() || Thread.currentThread().isInterrupted) break
-            if (database.isComplete(cat.type, cat.id)) continue
-            try {
-                database.storeCategory(cat, loadProviderCategory(config, cat))
-                completed++
-            } catch (error: Exception) {
-                failed++
-                Log.w("LumaTV", "Category unavailable: ${safeFailure(error)}")
+        onProgress(ImportProgress(completed, all.size, "Reading provider categories", films, shows, 0))
+        if (pending.isEmpty()) {
+            return ImportProgress(completed, all.size, "Already up to date", films, shows, 0)
+        }
+
+        val pool = Executors.newFixedThreadPool(parallelRequests.coerceIn(1, 4))
+        val completionQueue =
+            ExecutorCompletionService<Pair<ProviderCategory, Result<List<MediaEntry>>>>(pool)
+        var queued = 0
+        var running = 0
+        try {
+            while ((queued < pending.size || running > 0) &&
+                !isCancelled() && !Thread.currentThread().isInterrupted) {
+                while (running < parallelRequests.coerceIn(1, 4) && queued < pending.size) {
+                    val category = pending[queued++]
+                    completionQueue.submit(Callable {
+                        category to runCatching { loadProviderCategory(config, category) }
+                    })
+                    running++
+                }
+                val (category, fetched) = completionQueue.take().get()
+                running--
+                fetched.fold(
+                    onSuccess = { items ->
+                        // SQLite has a single writer; no concurrent write contention.
+                        database.storeCategory(category, items)
+                        completed++
+                        if (category.type == ContentType.MOVIE) films += items.distinctBy { it.id }.size
+                        else shows += items.distinctBy { it.id }.size
+                    },
+                    onFailure = { error ->
+                        failures++
+                        Log.w("LumaTV", "Category import failed: ${error.javaClass.simpleName}")
+                    }
+                )
+                onProgress(ImportProgress(completed, all.size, category.name, films, shows, failures))
             }
-            // Only count the changed content type, keeping memory bounded.
-            if (cat.type == ContentType.MOVIE) films = database.count(ContentType.MOVIE)
-            else shows = database.count(ContentType.SERIES)
-            onProgress(ImportProgress(completed, all.size, cat.name, films, shows, failed))
+        } finally {
+            pool.shutdownNow()
         }
         val result = ImportProgress(completed, all.size,
-            if (completed == all.size) "All categories loaded" else "Incomplete categories can be retried",
-            films, shows, failed)
+            if (completed == all.size) "All categories downloaded"
+            else "Unfinished categories will be retried",
+            films, shows, failures)
         onProgress(result)
         return result
     }
