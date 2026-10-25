@@ -58,6 +58,7 @@ class MainActivity : Activity() {
     private var progressSubtitle: TextView? = null
     private var syncingLabel: TextView? = null
     private var importing = false
+    @Volatile private var cancelImportRequested = false
     private val searchRender = Runnable { if (::body.isInitialized && !isFinishing) render() }
     private val worker = Executors.newSingleThreadExecutor()
     private val main = Handler(Looper.getMainLooper())
@@ -419,6 +420,16 @@ AppData.entries.isEmpty() && browsingTotal == 0 &&
             progressCounter = null; progressSubtitle = null
             selectTab(if (loadingShows > 0) "Series" else if (loadingFilms > 0) "Films" else "Live TV")
         }, Ui.columnParams(this, 8))
+        shell.addView(Ui.button(this, "Cancel connection / import", false) {
+            cancelImportRequested = true
+            importing = false
+            loading = false
+            progressBarView = null; progressHeadline = null
+            progressCounter = null; progressSubtitle = null
+            loadingMessage = "Import paused"
+            errorText = "The import was stopped. Your saved library is still available. Use Settings → Refresh library to retry."
+            render()
+        }, Ui.columnParams(this, 10))
         body.addView(shell, FrameLayout.LayoutParams(-1, -1))
         updateProgressViews()
     }
@@ -942,6 +953,7 @@ AppData.entries.isEmpty() && browsingTotal == 0 &&
         val config = AppData.config ?: return
         if (loading) return
         loading = true
+        cancelImportRequested = false
         loadingMessage = "Connecting to your live channels"
         loadingDone = 0; loadingTotal = 0
         importing = SourceService.xtreamFor(config) != null
@@ -959,7 +971,7 @@ AppData.entries.isEmpty() && browsingTotal == 0 &&
                             }
                         }
                     } else SourceService.loadDetailed(this, config)
-                if (AppData.config != config) return@execute
+                if (AppData.config != config || cancelImportRequested) return@execute
                 storage.saveCatalog(result.entries)
                 storage.saveCatalogReport(result.report)
                 storage.markCatalogRefreshed()
@@ -1008,6 +1020,7 @@ AppData.entries.isEmpty() && browsingTotal == 0 &&
         loadingMessage = "Resuming unfinished catalogue"
         loadingDone = 0; loadingTotal = 0
         importing = true
+        cancelImportRequested = false
         updateProgressViews()
         worker.execute {
             try { importCompleteLibrary(config) }
@@ -1050,7 +1063,8 @@ AppData.entries.isEmpty() && browsingTotal == 0 &&
                     updateProgressViews()
                 }
             }
-        }, isCancelled = { AppData.config != config || Thread.currentThread().isInterrupted },
+        }, isCancelled = { cancelImportRequested || AppData.config != config ||
+            Thread.currentThread().isInterrupted },
            parallelRequests = if (isTv) 3 else 4)
         storage.markFullImportComplete(outcome.done == outcome.total)
         val report = "Full provider import\nFilms: ${outcome.films}\n" +
