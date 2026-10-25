@@ -4,11 +4,19 @@ import android.content.Context
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
+import android.util.JsonReader
+import android.util.JsonToken
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
+import java.io.InputStreamReader
+import java.io.OutputStreamWriter
 import java.security.KeyStore
 import javax.crypto.Cipher
+import javax.crypto.CipherInputStream
+import javax.crypto.CipherOutputStream
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
@@ -60,25 +68,89 @@ class Storage(private val context: Context) {
     }
 
     // Force a one-time catalogue refresh when switching from the earlier M3U classifier.
-    fun needsCatalogRefresh(): Boolean = prefs.getInt("catalog_parser_version", 0) < 3
-    fun markCatalogRefreshed() { prefs.edit().putInt("catalog_parser_version", 3).apply() }
+    fun needsCatalogRefresh(): Boolean = prefs.getInt("catalog_parser_version", 0) < 4
+    fun markCatalogRefreshed() { prefs.edit().putInt("catalog_parser_version", 4).apply() }
 
     fun saveCatalogReport(report: String) { prefs.edit().putString("catalog_report", report).apply() }
     fun loadCatalogReport(): String = prefs.getString("catalog_report", "") ?: ""
 
+    // Write each item as it arrives rather than constructing a giant JSONArray,
+    // an equally large UTF-8 String and another encrypted byte array in memory.
     fun saveCatalog(entries: List<MediaEntry>) {
-        val array = JSONArray()
-        entries.forEach { array.put(it.toJson()) }
         val tmp = File(context.filesDir, "catalog.tmp")
-        tmp.writeBytes(seal(array.toString().toByteArray(Charsets.UTF_8)))
         val dest = File(context.filesDir, "catalog.enc")
-        if (!tmp.renameTo(dest)) { tmp.copyTo(dest, overwrite = true); tmp.delete() }
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(Cipher.ENCRYPT_MODE, key())
+        FileOutputStream(tmp).use { output ->
+            output.write(cipher.iv)
+            OutputStreamWriter(CipherOutputStream(output, cipher), Charsets.UTF_8).use { writer ->
+                writer.write("[")
+                entries.forEachIndexed { index, entry ->
+                    if (index != 0) writer.write(",")
+                    writer.write(entry.toJson().toString())
+                }
+                writer.write("]")
+            }
+        }
+        if (!tmp.renameTo(dest)) {
+            tmp.copyTo(dest, overwrite = true)
+            tmp.delete()
+        }
     }
 
+    // Read the old and new encrypted JSON formats with a streaming parser.
+    // This also supports an existing v1.2.0 cache without deleting user data.
     fun loadCatalog(): List<MediaEntry> = runCatching {
         val file = File(context.filesDir, "catalog.enc")
-        if (!file.exists()) return emptyList()
-        JSONArray(String(unseal(file.readBytes()), Charsets.UTF_8)).asObjects().map(MediaEntry::fromJson)
+        if (!file.exists()) return@runCatching emptyList()
+        FileInputStream(file).use { source ->
+            val iv = ByteArray(12)
+            var offset = 0
+            while (offset < iv.size) {
+                val n = source.read(iv, offset, iv.size - offset)
+                if (n < 0) error("Encrypted catalogue has an incomplete header")
+                offset += n
+            }
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(Cipher.DECRYPT_MODE, key(), GCMParameterSpec(128, iv))
+            JsonReader(InputStreamReader(CipherInputStream(source, cipher), Charsets.UTF_8)).use { json ->
+                val restored = ArrayList<MediaEntry>()
+                json.beginArray()
+                while (json.hasNext()) {
+                    if (restored.size >= 55_000) error("Saved catalogue exceeds the device safety limit")
+                    var id = ""; var title = ""; var url = ""; var type = ContentType.LIVE
+                    var group = "Other"; var image = ""; var description = ""; var epgId = ""
+                    var seriesId = ""; var season = 0; var episode = 0; var backdrop = ""
+                    var agent = ""; var referrer = ""
+                    json.beginObject()
+                    while (json.hasNext()) {
+                        when (json.nextName()) {
+                            "id" -> id = json.nextString()
+                            "title" -> title = json.nextString()
+                            "url" -> url = json.nextString()
+                            "type" -> type = runCatching { ContentType.valueOf(json.nextString()) }
+                                .getOrDefault(ContentType.LIVE)
+                            "group" -> group = json.nextString()
+                            "image" -> image = json.nextString()
+                            "description" -> description = json.nextString()
+                            "epgId" -> epgId = json.nextString()
+                            "seriesId" -> seriesId = json.nextString()
+                            "season" -> season = json.nextInt()
+                            "episode" -> episode = json.nextInt()
+                            "backdrop" -> backdrop = json.nextString()
+                            "httpUserAgent" -> agent = json.nextString()
+                            "httpReferrer" -> referrer = json.nextString()
+                            else -> json.skipValue()
+                        }
+                    }
+                    json.endObject()
+                    restored.add(MediaEntry(id, title, url, type, group, image, description,
+                        epgId, seriesId, season, episode, backdrop, agent, referrer))
+                }
+                json.endArray()
+                restored
+            }
+        }
     }.getOrDefault(emptyList())
 
     // Persist across refreshes and app upgrades. User-managed channel visibility is local to device.
