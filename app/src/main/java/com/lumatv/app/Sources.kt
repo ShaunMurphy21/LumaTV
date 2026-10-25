@@ -263,7 +263,7 @@ object SourceService {
         return FetchOutcome(unique,
             "${unique.size} returned from $succeeded/$attempted successful category requests" +
             (if (unique.isEmpty()) " (global: ${full.note}; category errors: $failed)" else "") +
-            (if (attempted < categories.size) " (not all categories checked; retry refresh or use Xtream login)" else ""))
+            (if (attempted < categories.size) " (preview only: $attempted of ${categories.size} categories; browse all provider categories for other languages)" else ""))
     }
 
     data class ProviderCategory(val id: String, val name: String, val type: ContentType)
