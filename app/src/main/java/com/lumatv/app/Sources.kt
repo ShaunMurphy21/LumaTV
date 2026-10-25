@@ -49,16 +49,19 @@ object SourceService {
     // Attempt discovery ONLY for the standard get.php-style URL with embedded credentials.
     private fun enrichM3u(provider: ProviderConfig, playlist: List<MediaEntry>): CatalogLoad {
         val baseReport = summary(playlist, "M3U playlist").report
-        if (playlist.any { it.type == ContentType.MOVIE } &&
-            playlist.any { it.type == ContentType.SERIES }) return CatalogLoad(playlist, baseReport)
+        val hasMovies = playlist.any { it.type == ContentType.MOVIE }
+        val hasSeries = playlist.any { it.type == ContentType.SERIES }
+        if (hasMovies && hasSeries) return CatalogLoad(playlist, baseReport)
         val xtream = xtreamFromM3u(provider) ?: return CatalogLoad(
             playlist, "$baseReport\nNo Xtream login could be derived from this M3U URL. " +
                 "If your provider offers Xtream login details, connect using the Xtream option to import films and series.")
         return try {
             val extra = loadXtream(xtream, loadLive = false)
+            // Do not rescan a 30,000-channel M3U for every single film/series item.
+            // That quadratic work could leave the spinner stuck for minutes.
             val additional = extra.entries.filter {
-                (it.type == ContentType.MOVIE && playlist.none { p -> p.type == ContentType.MOVIE }) ||
-                (it.type == ContentType.SERIES && playlist.none { p -> p.type == ContentType.SERIES })
+                (it.type == ContentType.MOVIE && !hasMovies) ||
+                (it.type == ContentType.SERIES && !hasSeries)
             }
             val combined = (playlist + additional).distinctBy { it.id }
             CatalogLoad(combined, summary(combined, "M3U + automatic Xtream VOD discovery").report +
@@ -166,6 +169,11 @@ object SourceService {
     }
 
     private data class FetchOutcome(val rows: List<JSONObject>, val note: String)
+    // JSON arrays can use many times their wire size once parsed by org.json.
+    // Never materialise an unbounded IPTV catalogue in the app process.
+    private const val MAX_CATALOGUE_BYTES = 10_000_000
+    private const val MAX_ROWS_PER_RESPONSE = 20_000
+    private const val MAX_ROWS_ACROSS_CATEGORIES = 35_000
 
     // Never turn an API failure into an unexplained empty library. Avoid echoing
     // HTTP URLs, usernames or passwords into diagnostic text.
@@ -187,7 +195,8 @@ object SourceService {
 
     private fun fetchArray(config: ProviderConfig, action: String, categoryId: String = ""): FetchOutcome {
         return try {
-            val payload = Net.readText(api(config, action, categoryId = categoryId), 80_000_000).trim()
+            val maxBytes = if (action.endsWith("_categories")) 2_000_000 else MAX_CATALOGUE_BYTES
+            val payload = Net.readText(api(config, action, categoryId = categoryId), maxBytes).trim()
             val array = when {
                 payload.startsWith("[") -> JSONArray(payload)
                 payload.startsWith("{") -> {
@@ -200,6 +209,9 @@ object SourceService {
                 payload.isEmpty() || payload == "null" || payload == "false" ->
                     return FetchOutcome(emptyList(), "no catalogue returned by provider")
                 else -> return FetchOutcome(emptyList(), "provider returned a non-JSON catalogue")
+            }
+            if (array.length() > MAX_ROWS_PER_RESPONSE) {
+                return FetchOutcome(emptyList(), "catalogue has too many entries in one response; trying categories")
             }
             val rows = array.asObjects()
             FetchOutcome(rows, "${rows.size} returned")
@@ -233,8 +245,11 @@ object SourceService {
             val response = fetchArray(config, action, id)
             attempted++
             if (response.note.contains("returned")) succeeded++ else failed++
-            recovered.addAll(response.rows)
-            if (listOf("HTTP 401", "HTTP 403", "HTTP 429").any { response.note == it }) break
+            val remaining = MAX_ROWS_ACROSS_CATEGORIES - recovered.size
+            if (remaining <= 0) break
+            recovered.addAll(response.rows.take(remaining))
+            if (recovered.size >= MAX_ROWS_ACROSS_CATEGORIES ||
+                listOf("HTTP 401", "HTTP 403", "HTTP 429").any { response.note == it }) break
         }
         val unique = recovered.distinctBy {
             it.optString("stream_id").ifBlank { it.optString("series_id") }
@@ -262,7 +277,8 @@ object SourceService {
         val seriesGroups = seriesCategories.rows.associate {
             it.optString("category_id") to it.optString("category_name", "Series")
         }
-        val liveResponse = if (loadLive) fetchArray(config, "get_live_streams") else FetchOutcome(emptyList(), "skipped")
+        val liveResponse = if (loadLive) fetchCatalogue(config, "get_live_streams", liveCategories.rows)
+            else FetchOutcome(emptyList(), "skipped")
         val movieResponse = fetchCatalogue(config, "get_vod_streams", movieCategories.rows)
         val seriesResponse = fetchCatalogue(config, "get_series", seriesCategories.rows)
         val base = config.url.trimEnd('/')
