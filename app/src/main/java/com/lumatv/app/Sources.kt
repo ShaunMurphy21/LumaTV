@@ -277,13 +277,13 @@ object SourceService {
         val seriesGroups = seriesCategories.rows.associate {
             it.optString("category_id") to it.optString("category_name", "Series")
         }
-        val liveResponse = if (loadLive) fetchCatalogue(config, "get_live_streams", liveCategories.rows)
-            else FetchOutcome(emptyList(), "skipped")
-        val movieResponse = fetchCatalogue(config, "get_vod_streams", movieCategories.rows)
-        val seriesResponse = fetchCatalogue(config, "get_series", seriesCategories.rows)
+        // Fetch and convert each catalogue in sequence. Holding several raw
+        // JSONObject arrays simultaneously could exhaust the Fire TV heap.
         val base = config.url.trimEnd('/')
         val u = Net.urlEncode(config.username)
         val p = Net.urlEncode(config.password)
+        val liveResponse = if (loadLive) fetchCatalogue(config, "get_live_streams", liveCategories.rows)
+            else FetchOutcome(emptyList(), "skipped")
         val live = liveResponse.rows.mapNotNull { j ->
             val sid = j.optString("stream_id").takeIf { it.isNotBlank() } ?: return@mapNotNull null
             val extension = if (config.liveFormat == "ts") "ts" else "m3u8"
@@ -294,6 +294,8 @@ object SourceService {
                 image = j.optString("stream_icon"), epgId = j.optString("epg_channel_id")
             )
         }
+        val liveNote = liveResponse.note
+        val movieResponse = fetchCatalogue(config, "get_vod_streams", movieCategories.rows)
         val vod = movieResponse.rows.mapNotNull { j ->
             val sid = j.optString("stream_id").takeIf { it.isNotBlank() } ?: return@mapNotNull null
             val ext = j.optString("container_extension", "mp4").let {
@@ -307,6 +309,8 @@ object SourceService {
                 description = j.optString("plot"), backdrop = j.optString("cover_big")
             )
         }
+        val movieNote = movieResponse.note
+        val seriesResponse = fetchCatalogue(config, "get_series", seriesCategories.rows)
         val shows = seriesResponse.rows.mapNotNull { j ->
             val sid = j.optString("series_id").takeIf { it.isNotBlank() } ?: return@mapNotNull null
             MediaEntry(
@@ -317,12 +321,13 @@ object SourceService {
                 backdrop = j.optJSONArray("backdrop")?.optString(0) ?: j.optString("backdrop")
             )
         }
+        val seriesNote = seriesResponse.note
         val all = live + vod + shows
         if (all.isEmpty() && loadLive) error("The provider returned no playable media. Check the provider login and Source diagnostics.")
         return CatalogLoad(all, "Xtream catalogue\n" +
-            "Live TV: ${live.size} (${liveResponse.note})\n" +
-            "Films: ${vod.size} (${movieResponse.note})\n" +
-            "Series: ${shows.size} (${seriesResponse.note})\n\n" +
+            "Live TV: ${live.size} (${liveNote})\n" +
+            "Films: ${vod.size} (${movieNote})\n" +
+            "Series: ${shows.size} (${seriesNote})\n\n" +
             "Movie categories: ${movieCategories.rows.size} (${movieCategories.note})\n" +
             "Series categories: ${seriesCategories.rows.size} (${seriesCategories.note})\n" +
             "If your provider has films/series but these counts are zero, check whether its Xtream login enables VOD and Series APIs.")
