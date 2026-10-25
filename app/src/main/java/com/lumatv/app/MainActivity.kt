@@ -91,6 +91,7 @@ class MainActivity : Activity() {
                 predictiveBackCallback!!
             )
         }
+        if (isTv) tvNavigation["Home"]?.requestFocus()
         val provider = AppData.config
         if (provider == null) {
             render()
@@ -119,9 +120,15 @@ class MainActivity : Activity() {
         }
     }
 
+    private var hasResumedOnce = false
+
     override fun onResume() {
         super.onResume()
-        if (::body.isInitialized && !loading) render()
+        // Avoid destroying the Fire TV grid and losing D-pad position each
+        // time playback or another activity returns to the foreground.
+        if (hasResumedOnce && ::body.isInitialized && !loading &&
+            (!isTv || tab == "My List")) render()
+        hasResumedOnce = true
     }
 
     override fun onConfigurationChanged(newConfig: Configuration) {
