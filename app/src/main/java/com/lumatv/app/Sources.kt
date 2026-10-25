@@ -266,6 +266,73 @@ object SourceService {
             (if (attempted < categories.size) " (not all categories checked; retry refresh or use Xtream login)" else ""))
     }
 
+    data class ProviderCategory(val id: String, val name: String, val type: ContentType)
+
+    /** Retrieve ALL category names, not only the first 80 used for preview import. */
+    fun providerCategories(provider: ProviderConfig, type: ContentType): List<ProviderCategory> {
+        require(type == ContentType.SERIES || type == ContentType.MOVIE)
+        val config = when (provider.kind) {
+            "xtream" -> provider
+            "m3u" -> xtreamFromM3u(provider)
+                ?: error("To browse all provider categories, connect with your Xtream login.")
+            else -> error("This source does not expose Xtream category APIs.")
+        }
+        val action = if (type == ContentType.SERIES) "get_series_categories" else "get_vod_categories"
+        val response = fetchArray(config, action)
+        if (response.rows.isEmpty()) error("No provider categories received (${response.note}).")
+        return response.rows.mapNotNull { row ->
+            val id = row.optString("category_id").takeIf(String::isNotBlank) ?: return@mapNotNull null
+            ProviderCategory(id, row.optString("category_name").ifBlank { "Category $id" }, type)
+        }.distinctBy { it.id }
+    }
+
+    /**
+     * Load one selected language/category at a time, avoiding a 383-category
+     * network sweep and the huge memory costs of keeping all VOD in RAM.
+     */
+    fun loadProviderCategory(provider: ProviderConfig, category: ProviderCategory): List<MediaEntry> {
+        val config = when (provider.kind) {
+            "xtream" -> provider
+            "m3u" -> xtreamFromM3u(provider)
+                ?: error("An Xtream login is required for remote categories.")
+            else -> error("Remote categories are unavailable for this source.")
+        }
+        val type = category.type
+        require(type == ContentType.SERIES || type == ContentType.MOVIE)
+        val action = if (type == ContentType.SERIES) "get_series" else "get_vod_streams"
+        val response = fetchArray(config, action, category.id)
+        if (response.rows.isEmpty()) error("No titles loaded from ${category.name} (${response.note}).")
+        val base = config.url.trimEnd('/')
+        val user = Net.urlEncode(config.username)
+        val pass = Net.urlEncode(config.password)
+        return response.rows.mapNotNull { row ->
+            val title = row.optString("name").ifBlank { row.optString("title") }.ifBlank { "Untitled" }
+            val categoryKey = row.optString("category_id").ifBlank { category.id }
+            if (type == ContentType.SERIES) {
+                val sid = row.optString("series_id").takeIf(String::isNotBlank) ?: return@mapNotNull null
+                MediaEntry(
+                    id = makeId("series", base, sid, row.optString("name"), categoryKey),
+                    title = title, type = ContentType.SERIES, group = category.name,
+                    image = row.optString("cover").ifBlank { row.optString("stream_icon") },
+                    description = row.optString("plot"), seriesId = sid,
+                    backdrop = row.optJSONArray("backdrop")?.optString(0) ?: row.optString("backdrop")
+                )
+            } else {
+                val sid = row.optString("stream_id").takeIf(String::isNotBlank) ?: return@mapNotNull null
+                val ext = row.optString("container_extension", "mp4").let {
+                    if (it.matches(Regex("[a-zA-Z0-9]{2,5}"))) it else "mp4"
+                }
+                MediaEntry(
+                    id = makeId("movie", base, sid, row.optString("name"), categoryKey),
+                    title = title, url = "$base/movie/$user/$pass/$sid.$ext",
+                    type = ContentType.MOVIE, group = category.name,
+                    image = row.optString("stream_icon").ifBlank { row.optString("cover") },
+                    description = row.optString("plot"), backdrop = row.optString("cover_big")
+                )
+            }
+        }
+    }
+
     private fun loadXtream(config: ProviderConfig, loadLive: Boolean = true): CatalogLoad {
         require(Net.validHttp(config.url)) { "Enter a full http:// or https:// server address." }
         val status = JSONObject(Net.readText(api(config), 1_000_000))
