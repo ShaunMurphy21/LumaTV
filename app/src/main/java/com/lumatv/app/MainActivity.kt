@@ -106,7 +106,9 @@ class MainActivity : Activity() {
                 main.post {
                     if (isFinishing || isDestroyed || AppData.config != provider) return@post
                     loading = false
-                    if (cached.isEmpty()) {
+                    val hasSavedVod = catalogue.count(ContentType.MOVIE) > 0 ||
+                        catalogue.count(ContentType.SERIES) > 0
+                    if (cached.isEmpty() && !hasSavedVod) {
                         refresh()
                     } else {
                         AppData.entries = cached
@@ -171,7 +173,7 @@ class MainActivity : Activity() {
         header.addView(Ui.button(this, "⚙", false) { showSettings() }.apply {
             textSize = 21f; setPadding(dp(15), dp(7), dp(15), dp(7))
         })
-        if (isTv) {
+        run {
             syncingLabel = Ui.text(this, "", 13f, Ui.MINT, true).apply {
                 isFocusable = true
                 isClickable = true
@@ -949,7 +951,14 @@ AppData.entries.isEmpty() && browsingTotal == 0 &&
             try {
                 // Bootstrap Live TV without importing and duplicating 80 categories of VOD.
                 val result = if (config.kind == "xtream")
-                    SourceService.loadXtreamLive(config) else SourceService.loadDetailed(this, config)
+                    SourceService.loadXtreamLive(config) { stage ->
+                        main.post {
+                            if (!isFinishing && !isDestroyed && AppData.config == config) {
+                                loadingMessage = stage
+                                updateProgressViews()
+                            }
+                        }
+                    } else SourceService.loadDetailed(this, config)
                 if (AppData.config != config) return@execute
                 storage.saveCatalog(result.entries)
                 storage.saveCatalogReport(result.report)
@@ -957,7 +966,16 @@ AppData.entries.isEmpty() && browsingTotal == 0 &&
                 AppData.entries = result.entries
                 AppData.catalogReport = result.report
                 if (SourceService.xtreamFor(config) != null) {
-                    // The full import runs on the existing background worker.
+                    // Users can browse the Live TV preview immediately. Keep
+                    // downloading all remaining VOD categories behind the UI.
+                    if (result.entries.isNotEmpty()) {
+                        main.post {
+                            if (!isFinishing && !isDestroyed && AppData.config == config) {
+                                loading = false
+                                render()
+                            }
+                        }
+                    }
                     importCompleteLibrary(config)
                 } else {
                     main.post {
@@ -984,11 +1002,13 @@ AppData.entries.isEmpty() && browsingTotal == 0 &&
 
     private fun resumeFullImport(config: ProviderConfig) {
         if (loading) return
-        loading = true
+        // The last update trapped returning users behind an all-screen spinner
+        // whenever an import was incomplete. Keep the existing library usable.
+        loading = false
         loadingMessage = "Resuming unfinished catalogue"
         loadingDone = 0; loadingTotal = 0
         importing = true
-        render()
+        updateProgressViews()
         worker.execute {
             try { importCompleteLibrary(config) }
             catch (e: Exception) {
@@ -1023,6 +1043,10 @@ AppData.entries.isEmpty() && browsingTotal == 0 &&
                     loadingMessage = progress.category
                     loadingFilms = progress.films; loadingShows = progress.series
                     loadingFailures = progress.failed
+                    if (loading && (progress.films + progress.series > 0)) {
+                        loading = false
+                        render()
+                    }
                     updateProgressViews()
                 }
             }
