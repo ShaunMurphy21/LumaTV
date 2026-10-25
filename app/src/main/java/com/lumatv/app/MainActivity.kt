@@ -50,9 +50,11 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        CrashReporter.install(applicationContext)
         storage = Storage(this)
         AppData.config = storage.loadProvider()
-        AppData.entries = storage.loadCatalog()
+        // A large encrypted library must never be decoded on Android's UI thread.
+        AppData.entries = emptyList()
         AppData.catalogReport = storage.loadCatalogReport()
         buildShell()
         if (android.os.Build.VERSION.SDK_INT >= 33) {
@@ -64,11 +66,28 @@ class MainActivity : Activity() {
                 predictiveBackCallback!!
             )
         }
-        if (AppData.config != null && (AppData.entries.isEmpty() || storage.needsCatalogRefresh())) refresh() else {
+        val provider = AppData.config
+        if (provider == null) {
             render()
-            AppData.config?.let { source ->
-                val guide = SourceService.epgUrl(source)
-                if (guide.isNotBlank()) fetchEpg(source, AppData.entries)
+        } else if (storage.needsCatalogRefresh()) {
+            // On upgrade, skip decoding a potentially huge legacy cache.
+            refresh()
+        } else {
+            loading = true
+            render()
+            worker.execute {
+                val cached = storage.loadCatalog()
+                main.post {
+                    if (isFinishing || isDestroyed || AppData.config != provider) return@post
+                    loading = false
+                    if (cached.isEmpty()) {
+                        refresh()
+                    } else {
+                        AppData.entries = cached
+                        render()
+                        if (SourceService.epgUrl(provider).isNotBlank()) fetchEpg(provider, cached)
+                    }
+                }
             }
         }
     }
@@ -662,7 +681,22 @@ class MainActivity : Activity() {
         } else {
             panel.addView(Ui.button(this, "Add a source") { dialog.dismiss(); showWelcome() })
         }
-        panel.addView(Ui.text(this, "LumaTV 1.2 • Android & Fire TV • Local settings", 11f, Ui.MUTED), Ui.columnParams(this, 9))
+        panel.addView(Ui.button(this, "Last crash report (safe to share)", false) {
+            dialog.dismiss()
+            val details = CrashReporter.lastReport(this).ifBlank {
+                "No crash report recorded by this version yet. If importing still crashes, reopen LumaTV and view this screen."
+            }
+            AlertDialog.Builder(this).setTitle("LumaTV crash diagnostics")
+                .setMessage(details)
+                .setPositiveButton("OK", null)
+                .setNeutralButton("Copy report") { _, _ ->
+                    val clip = android.content.ClipData.newPlainText("LumaTV crash report", details)
+                    (getSystemService(CLIPBOARD_SERVICE) as android.content.ClipboardManager)
+                        .setPrimaryClip(clip)
+                    Toast.makeText(this, "Crash report copied", Toast.LENGTH_SHORT).show()
+                }.show()
+        }, Ui.columnParams(this, 9))
+        panel.addView(Ui.text(this, "LumaTV 1.2.1 • Android & Fire TV • Local settings", 11f, Ui.MUTED), Ui.columnParams(this, 9))
         dialog.show()
     }
 
