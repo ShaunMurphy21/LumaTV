@@ -1,54 +1,49 @@
-# LumaTV v1.1.0 — phone, foldable & Fire TV IPTV player
+# LumaTV 1.2.0 — Films & Series catalogue repair
 
-Android IPTV client for **your own legally accessible M3U playlists or Xtream-compatible service**. No channels, subscriptions or commercial media are supplied.
+An Android and Fire TV IPTV player for **IPTV content you are authorised to access**. The app does not provide any channels, subscriptions, media or IPTV credentials.
 
-## What's new in 1.1.0
+## What changed in 1.2.0
 
-- **Films and series:** updated M3U classification. Movie/VOD/Film groups now appear under Films; streams in Series groups or with `S01E02`, `1x02`, `Season 1 Episode 2` naming are grouped into a Series/episode browser. Xtream VOD/series endpoints are now handled independently, so a missing optional endpoint does not abort the entire import. The app automatically **refreshes the cached catalogue once after upgrading** so older, incorrectly classified items get updated.
-- **Separate searches:** Home searches all titles; Live TV, Films, Series, and My List search only their own content. Switching tabs resets the search. A visible `✕` control and Android/remote Back clear search; Back also exits a category or tab.
-- **Hide channels:** Settings → **Manage visible channels**. Search for individual channels and tap to hide/show, choose a category to hide/show en masse, or tap **Show all**. Hidden channels are excluded from Home, Live TV, search and My List but remain in your provider playlist. This preference persists locally across refreshes and app upgrades.
-- **Episode autoplay:** automatically starts the next episode when the current episode finishes; manually skip via **Next ▶** in the player. Toggle via Settings → **Autoplay next episode**. Episode order follows season then episode number; playback resume is retained.
-- **Fire TV / Android TV:** Android TV Leanback launcher entry, 320×180 banner, touchscreen optional, larger navigation for TV, D-pad-focusable cards/menus/episodes and player media-key controls. Works best on Fire OS 6+ / Android 6+ hardware. Device codecs, streaming formats, video DRM and sideloading policies still affect compatibility. Fire TV remote behavior has not been hardware-tested yet.
+- **Fix silent VOD/Series failures.** In previous versions, `get_vod_streams` and `get_series` errors were caught and treated as empty lists. Now the app records a readable, credential-safe result for each catalogue request.
+- **More compatible Xtream responses.** Supports direct JSON arrays and common object-wrapped arrays (`data`, `results`, `items`, `streams`, `movies`, `series`, `categories`).
+- **Fallback by category.** If the bulk `get_vod_streams` / `get_series` endpoint returns an empty result, an unsupported format or an oversized catalogue, try `category_id`-filtered calls where categories are available. Retries are bounded to protect your device and won't repeat explicit HTTP 401, 403 or 429 failures.
+- **M3U playlist enrichment.** If a live-only or partly populated M3U uses a standard `get.php?username=...&password=...` link, try the same provider's Xtream VOD/Series catalogue. Already-listed M3U channels are preserved. M3U files or URLs without credentials do not automatically provide other media.
+- **Episode browser for discovered shows.** Xtream series discovered through M3U use `get_series_info` for their episodes.
+- **Catalogue diagnostics.** Settings → **Catalogue diagnostics** shows counts and API response statuses (without usernames, passwords or URLs). There is also a diagnostics button on the empty Films and Series screens.
+- **Automatic catalogue refresh.** On first launch after upgrading from v1.1.x, the app refreshes the saved library; provider settings, channel visibility choices and favourites are retained when the APK signing key matches.
+- Fire TV launcher, remote support, hidden channel filtering, separate search tabs and episode autoplay remain available.
 
-## Install an updated APK using your Samsung + GitHub Codespaces
+**Important:** Film and series imports still depend on the provider exposing them to the account and responding to Xtream/M3U requests. This update fixes several client-side failure paths but cannot guarantee any particular provider's content.
 
-1. Download `LumaTV-v1.1.0-FireTV-and-Fixes.zip` from this conversation.
-2. Open your existing `https://github.com/ShaunMurphy21/LumaTV` repository, Code → Codespaces → your Codespace (create one if necessary).
-3. Upload the ZIP to the **repository root** (same folder as `settings.gradle.kts`). In Samsung Internet/Chrome enable Desktop site if Upload is hidden.
-4. Codespaces terminal:
+## Build from your Samsung using GitHub Codespaces
+
+1. Download `LumaTV-v1.2.0-Catalogue-Fix.zip` from ChatGPT and upload it to the root folder of your Codespace for `https://github.com/ShaunMurphy21/LumaTV` (the same folder containing `settings.gradle.kts`).
+2. In the Codespaces terminal run:
 
    ```bash
-   unzip -o LumaTV-v1.1.0-FireTV-and-Fixes.zip
-   rm -f LumaTV-v1.1.0-FireTV-and-Fixes.zip
+   unzip -o LumaTV-v1.2.0-Catalogue-Fix.zip
+   rm -f LumaTV-v1.2.0-Catalogue-Fix.zip
    git add -A
-   git commit -m "LumaTV 1.1: VOD, series, searches, hidden channels, autoplay, Fire TV"
+   git commit -m "Fix Xtream films and series catalogue loading v1.2.0"
    git push
    ```
 
-5. Open GitHub repository → Actions → **Build installable Android APK** → latest green run → Artifacts → `LumaTV-debug-apk` → extract `app-debug.apk`.
-6. Install on Samsung, over the existing LumaTV version. Both APKs use the same `com.lumatv.app` application ID; saved account/visibility settings should remain if signed by the same debug signing key. **GitHub Actions uses a new ephemeral debug keystore on some builds**, so if Android reports *App not installed* due to conflicting signature you may have to remove the previous debug build (which deletes app data) before installing. Keep your provider login handy.
-7. On initial app launch following the update the playlist **refreshes automatically**. You can also select Settings → Refresh library.
+3. Visit `https://github.com/ShaunMurphy21/LumaTV/actions` to verify the build passed.
+4. Visit `https://github.com/ShaunMurphy21/LumaTV/releases`. If your existing Releases workflow has permission to publish, download the new `LumaTV-build-N.apk` from the latest successful pre-release, or use the Actions artifact.
+5. Install the APK on your Samsung or sideload it to a compatible Fire TV device.
 
-## Fire TV installation
+## Test after updating
 
-- Copy the GitHub-built `app-debug.apk` to Fire TV through a trusted file-transfer/sideloading method (for example the `Downloader` app and a URL where **you** securely host the APK, or ADB from a computer/network). Do not expose IPTV credentials through public download links.
-- On Fire TV, enable installation from your chosen source under Settings → My Fire TV → Developer Options → Install unknown apps, **if that option is available on your model/Fire OS version**. Recent Fire OS software can differ.
-- Install the APK, then launch **LumaTV** from your apps library. Use the Fire TV remote D-pad / Select / Back; input your playlist/provider via the TV on-screen keyboard.
-- Media formats such as provider-specific MPEG-TS/HLS, codecs and DRM vary. PiP needs Android 8+ and compatible firmware.
+1. Open the app and allow the initial library refresh to complete, or choose **Settings → Refresh library**.
+2. Open **Films** and **Series**. If either is empty, choose **View catalogue diagnostics** (or Settings → Catalogue diagnostics).
+3. The report distinguishes 0 returned, HTTP 401/403, requests timed out, unsupported JSON, and category-by-category fallback. Share the **report text only** if more help is needed. Do not share the IPTV URL, username, password, or screenshots containing them.
+4. If connected through an M3U file or an opaque M3U link, and the provider gives you a separate Xtream server/username/password, try connecting through **Connect Xtream provider** for full VOD and series support.
+5. Once the Series tab has entries, select a show and verify that its seasons/episodes load.
 
-## Quick smoke test
+## Debug build warning
 
-For a test without a provider, connect **Explore with sample streams**. The demo now includes one live stream, sample films, and a two-episode **Demo Series**; open the Series tab and play the first episode. Switch to Films and search for `Bunny` to test scoped search. In settings, check that autoplay is on; the player should start the second demo episode after the first finishes. For channel hiding, open Settings → Manage visible channels, hide the demo live stream and return to Live TV to verify it's gone, then Show all to restore it.
+The existing GitHub Actions workflow makes a **debug-signed APK**, and different runner keystores can prevent upgrades over earlier builds. If Android reports a signing conflict, uninstalling the old version before installing the new one removes local settings and provider credentials. Keep your details safely stored elsewhere. For seamless future updates, configure persistent APK signing through GitHub Actions secrets.
 
-## Important provider limitation
+## Validation status
 
-Movies/series only show when the connected service actually exposes them. Xtream providers usually supply `get_vod_streams`, `get_series` and `get_series_info`; some accounts are live-only or disable these endpoints. M3U has no universal movie/TV-series metadata standard, so inference depends on `group-title`, URL paths and episode naming. An M3U with unlabelled media cannot be reliably organised into shows automatically.
-
-## Build stack
-
-- Kotlin 2.2.20; Gradle 8.11.1; Android Gradle Plugin 8.10.1
-- minSdk 23 (Android 6); targetSdk 35; compileSdk 36
-- AndroidX Media3 (ExoPlayer, HLS, DASH), RecyclerView; Android Keystore encrypted provider credentials and catalogue
-- Workflow: `.github/workflows/build-apk.yml`; `android-actions/setup-android@v4`; JDK 17
-
-**Status:** The updated source archive has been generated and checked locally, but it has **not** been compiled by the Android SDK or tested on a physical Samsung/Fire TV device in this environment. The GitHub Actions build is still required, and device-specific bugs may remain.
+The updated `Sources.kt` compiled using a local Kotlin compiler with Android/JSON test stubs. A local M3U fixture passed checks for Live, Films, Series and episode grouping. A **full Android Gradle build and real-provider test have not been performed** in this environment; GitHub Actions must compile the APK and the source must be tested against your provider.

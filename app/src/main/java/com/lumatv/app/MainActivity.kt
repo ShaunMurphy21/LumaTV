@@ -53,6 +53,7 @@ class MainActivity : Activity() {
         storage = Storage(this)
         AppData.config = storage.loadProvider()
         AppData.entries = storage.loadCatalog()
+        AppData.catalogReport = storage.loadCatalogReport()
         buildShell()
         if (android.os.Build.VERSION.SDK_INT >= 33) {
             predictiveBackCallback = android.window.OnBackInvokedCallback {
@@ -372,6 +373,18 @@ class MainActivity : Activity() {
             layout.addView(Ui.text(this, message, 15f, Ui.MUTED).apply {
                 setPadding(dp(23), dp(35), dp(23), 0)
             })
+            if ((tab == "Films" || tab == "Series") && search.isBlank()) {
+                layout.addView(Ui.button(this, "View catalogue diagnostics", false) {
+                    AlertDialog.Builder(this)
+                        .setTitle("Catalogue import report")
+                        .setMessage(AppData.catalogReport.ifBlank { "No diagnostics yet. Refresh library in Settings." })
+                        .setPositiveButton("OK", null)
+                        .setNeutralButton("Refresh now") { _, _ -> refresh() }
+                        .show()
+                }, Ui.columnParams(this, 12).apply {
+                    leftMargin = dp(21); rightMargin = dp(21)
+                })
+            }
         } else {
             val span = when {
                 resources.configuration.screenWidthDp >= 840 -> 5
@@ -539,6 +552,7 @@ class MainActivity : Activity() {
         AppData.config = config
         AppData.entries = emptyList()
         AppData.schedules = emptyMap()
+        AppData.catalogReport = ""
         AppData.episodeQueue = emptyList(); AppData.episodeQueueFor = ""
         storage.saveProvider(config)
         refresh()
@@ -550,14 +564,17 @@ class MainActivity : Activity() {
         loading = true; errorText = ""; render()
         worker.execute {
             try {
-                val entries = SourceService.load(this, config)
+                val result = SourceService.loadDetailed(this, config)
+                val entries = result.entries
                 if (AppData.config != config) return@execute
                 storage.saveCatalog(entries)
+                storage.saveCatalogReport(result.report)
                 storage.markCatalogRefreshed()
                 main.post {
                     if (isFinishing || isDestroyed) return@post
                     if (AppData.config != config) return@post
                     AppData.entries = entries
+                    AppData.catalogReport = result.report
                     loading = false
                     category = "All"
                     render()
@@ -597,6 +614,18 @@ class MainActivity : Activity() {
         }
         val dialog = AlertDialog.Builder(this).setView(ScrollView(this).apply { addView(panel) }).create()
         if (config != null) {
+            panel.addView(Ui.button(this, "Catalogue diagnostics (Live / Films / Series)", false) {
+                dialog.dismiss()
+                val report = AppData.catalogReport.ifBlank {
+                    "No import report saved yet. Tap Refresh library to check your provider's Live TV, Films and Series API responses."
+                }
+                AlertDialog.Builder(this)
+                    .setTitle("Catalogue import report")
+                    .setMessage(report)
+                    .setPositiveButton("OK", null)
+                    .setNeutralButton("Refresh library") { _, _ -> refresh() }
+                    .show()
+            }, Ui.columnParams(this, 9))
             panel.addView(Ui.button(this, "Manage visible channels", false) {
                 dialog.dismiss()
                 startActivity(Intent(this, ChannelManagerActivity::class.java))
@@ -633,13 +662,14 @@ class MainActivity : Activity() {
         } else {
             panel.addView(Ui.button(this, "Add a source") { dialog.dismiss(); showWelcome() })
         }
-        panel.addView(Ui.text(this, "LumaTV 1.1 • Android & Fire TV • Local settings", 11f, Ui.MUTED), Ui.columnParams(this, 9))
+        panel.addView(Ui.text(this, "LumaTV 1.2 • Android & Fire TV • Local settings", 11f, Ui.MUTED), Ui.columnParams(this, 9))
         dialog.show()
     }
 
     private fun disconnect() {
         storage.clearProvider()
         AppData.config = null; AppData.entries = emptyList(); AppData.schedules = emptyMap()
+        AppData.catalogReport = ""
         AppData.episodeQueue = emptyList(); AppData.episodeQueueFor = ""
         tab = "Home"; category = "All"; errorText = ""
         clearSearch()

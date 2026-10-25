@@ -1,18 +1,24 @@
-name: Build installable Android APK
+name: Build and publish LumaTV APK
 
 on:
   workflow_dispatch:
   push:
     branches: [main, master]
+    tags:
+      - 'v*'
 
+# Publishing to GitHub Releases requires a write-capable GITHUB_TOKEN.
 permissions:
   contents: read
 
 jobs:
   build:
-    name: Android debug APK
+    name: Build APK and publish Release
     runs-on: ubuntu-latest
     timeout-minutes: 40
+    permissions:
+      contents: write
+
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
@@ -23,13 +29,12 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      # v3 installed Google's removed legacy `tools` package. v4 fixes that.
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
         with:
           packages: 'platform-tools'
 
-      - name: Install required SDK platform and build tools
+      - name: Install Android platform and build tools
         run: sdkmanager --install 'platforms;android-36' 'build-tools;35.0.0'
 
       - name: Set up Gradle
@@ -37,16 +42,67 @@ jobs:
         with:
           gradle-version: '8.11.1'
 
-      - name: Compile APK
+      - name: Compile debug APK
         run: gradle --no-daemon --stacktrace :app:assembleDebug
 
-      - name: Verify APK exists
-        run: test -s app/build/outputs/apk/debug/app-debug.apk
+      - name: Set release details
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            release_tag="${GITHUB_REF#refs/tags/}"
+            release_title="LumaTV ${release_tag}"
+            prerelease=false
+            make_latest=true
+          else
+            # Every successful main/master build is available in Releases.
+            release_tag="build-${GITHUB_RUN_NUMBER}"
+            release_title="LumaTV Development Build ${GITHUB_RUN_NUMBER}"
+            prerelease=true
+            make_latest=false
+          fi
+          echo "tag=${release_tag}" >> "$GITHUB_OUTPUT"
+          echo "title=${release_title}" >> "$GITHUB_OUTPUT"
+          echo "prerelease=${prerelease}" >> "$GITHUB_OUTPUT"
+          echo "make_latest=${make_latest}" >> "$GITHUB_OUTPUT"
 
-      - name: Publish installable APK
+      - name: Prepare APK for direct installation
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          test -s app/build/outputs/apk/debug/app-debug.apk
+          cp app/build/outputs/apk/debug/app-debug.apk "dist/LumaTV-${{ steps.release.outputs.tag }}.apk"
+          test -s "dist/LumaTV-${{ steps.release.outputs.tag }}.apk"
+          sha256sum dist/*.apk > dist/SHA256SUMS.txt
+
+      - name: Keep a copy under Actions artifacts
         uses: actions/upload-artifact@v4
         with:
           name: LumaTV-debug-apk
-          path: app/build/outputs/apk/debug/app-debug.apk
+          path: |
+            dist/*.apk
+            dist/SHA256SUMS.txt
           if-no-files-found: error
           retention-days: 14
+
+      - name: Create GitHub Release with APK
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.release.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: ${{ steps.release.outputs.title }}
+          prerelease: ${{ steps.release.outputs.prerelease }}
+          make_latest: ${{ steps.release.outputs.make_latest }}
+          fail_on_unmatched_files: true
+          body: |
+            Download the `.apk` below and sideload it on a compatible Android or Fire TV device.
+
+            This is a DEBUG-signed development build, not a production-signed release.
+            Debug signing keys on GitHub runners can differ between builds; an existing
+            LumaTV installation may need uninstalling before installing this one.
+            Uninstalling clears locally saved settings and IPTV provider credentials.
+          files: |
+            dist/*.apk
+            dist/SHA256SUMS.txt

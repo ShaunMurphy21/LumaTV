@@ -33,7 +33,8 @@ object Net {
     }
 
     fun readText(url: String, maxBytes: Int = 24_000_000): String {
-        val (connection, stream) = open(url)
+        // Large IPTV catalogues can take longer than a short channel metadata request.
+        val (connection, stream) = open(url, if (maxBytes >= 60_000_000) 45_000 else 20_000)
         try {
             stream.use { input ->
                 val out = java.io.ByteArrayOutputStream()

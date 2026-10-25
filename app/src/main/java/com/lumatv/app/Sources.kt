@@ -18,16 +18,55 @@ object SourceService {
 
     private val metadata = Regex("([A-Za-z][A-Za-z0-9_-]*)\\s*=\\s*\"([^\"]*)\"")
 
-    fun load(context: Context, provider: ProviderConfig): List<MediaEntry> = when (provider.kind) {
-        "demo" -> demo()
+    data class CatalogLoad(val entries: List<MediaEntry>, val report: String)
+
+    fun load(context: Context, provider: ProviderConfig): List<MediaEntry> =
+        loadDetailed(context, provider).entries
+
+    fun loadDetailed(context: Context, provider: ProviderConfig): CatalogLoad = when (provider.kind) {
+        "demo" -> summary(demo(), "Demo catalogue")
         "m3u" -> {
             val (connection, stream) = Net.open(provider.url, 30_000)
-            try { stream.use { parseM3u(it) } } finally { connection.disconnect() }
+            val playlist = try { stream.use { parseM3u(it) } } finally { connection.disconnect() }
+            enrichM3u(provider, playlist)
         }
-        "file" -> context.contentResolver.openInputStream(Uri.parse(provider.url))?.use { parseM3u(it) }
-            ?: error("Cannot access that playlist file. Import it again.")
+        "file" -> {
+            val items = context.contentResolver.openInputStream(Uri.parse(provider.url))?.use { parseM3u(it) }
+                ?: error("Cannot access that playlist file. Import it again.")
+            summary(items, "Local M3U file: only content listed in the file can be imported")
+        }
         "xtream" -> loadXtream(provider)
         else -> error("Unsupported provider type")
+    }
+
+    private fun summary(items: List<MediaEntry>, label: String): CatalogLoad = CatalogLoad(items,
+        "$label\nLive TV: ${items.count { it.type == ContentType.LIVE }}\n" +
+        "Films: ${items.count { it.type == ContentType.MOVIE }}\n" +
+        "Series: ${items.count { it.type == ContentType.SERIES }}")
+
+    // Many M3U links use the same credentials as Xtream. A live-only M3U export
+    // can therefore still expose its VOD catalogue via player_api.php.
+    // Attempt discovery ONLY for the standard get.php-style URL with embedded credentials.
+    private fun enrichM3u(provider: ProviderConfig, playlist: List<MediaEntry>): CatalogLoad {
+        val baseReport = summary(playlist, "M3U playlist").report
+        if (playlist.any { it.type == ContentType.MOVIE } &&
+            playlist.any { it.type == ContentType.SERIES }) return CatalogLoad(playlist, baseReport)
+        val xtream = xtreamFromM3u(provider) ?: return CatalogLoad(
+            playlist, "$baseReport\nNo Xtream login could be derived from this M3U URL. " +
+                "If your provider offers Xtream login details, connect using the Xtream option to import films and series.")
+        return try {
+            val extra = loadXtream(xtream, loadLive = false)
+            val additional = extra.entries.filter {
+                (it.type == ContentType.MOVIE && playlist.none { p -> p.type == ContentType.MOVIE }) ||
+                (it.type == ContentType.SERIES && playlist.none { p -> p.type == ContentType.SERIES })
+            }
+            val combined = (playlist + additional).distinctBy { it.id }
+            CatalogLoad(combined, summary(combined, "M3U + automatic Xtream VOD discovery").report +
+                "\n\nXtream discovery:\n" + extra.report)
+        } catch (e: Exception) {
+            CatalogLoad(playlist, "$baseReport\nXtream discovery unavailable: ${safeFailure(e)}. " +
+                "Use an Xtream provider login if available.")
+        }
     }
 
     fun parseM3u(input: InputStream): List<MediaEntry> {
@@ -101,7 +140,20 @@ object SourceService {
         return (series.values + entries).distinctBy { it.id }
     }
 
-    private fun api(config: ProviderConfig, action: String = "", seriesId: String = ""): String {
+    private fun xtreamFromM3u(provider: ProviderConfig): ProviderConfig? {
+        if (provider.kind != "m3u" || !Net.validHttp(provider.url)) return null
+        val uri = Uri.parse(provider.url)
+        val endpoint = uri.path.orEmpty().substringAfterLast('/').lowercase()
+        if (endpoint !in setOf("get.php", "playlist.php", "m3u.php")) return null
+        val username = uri.getQueryParameter("username")?.takeIf { it.isNotBlank() } ?: return null
+        val password = uri.getQueryParameter("password")?.takeIf { it.isNotBlank() } ?: return null
+        val base = provider.url.substringBefore('?').substringBeforeLast('/')
+        return ProviderConfig("xtream", provider.name, base, username, password, provider.epgUrl)
+    }
+
+    private fun api(
+        config: ProviderConfig, action: String = "", seriesId: String = "", categoryId: String = ""
+    ): String {
         val base = config.url.trim().trimEnd('/')
         val params = mutableListOf(
             "username=${Net.urlEncode(config.username)}",
@@ -109,33 +161,115 @@ object SourceService {
         )
         if (action.isNotBlank()) params.add("action=${Net.urlEncode(action)}")
         if (seriesId.isNotBlank()) params.add("series_id=${Net.urlEncode(seriesId)}")
+        if (categoryId.isNotBlank()) params.add("category_id=${Net.urlEncode(categoryId)}")
         return "$base/player_api.php?${params.joinToString("&")}" 
     }
 
-    private fun array(config: ProviderConfig, action: String): List<JSONObject> =
-        runCatching { JSONArray(Net.readText(api(config, action), 60_000_000)).asObjects() }
-            .onFailure { Log.w("LumaTV", "Xtream endpoint $action unavailable: ${it.message}") }
-            .getOrDefault(emptyList())
+    private data class FetchOutcome(val rows: List<JSONObject>, val note: String)
 
-    private fun loadXtream(config: ProviderConfig): List<MediaEntry> {
+    // Never turn an API failure into an unexplained empty library. Avoid echoing
+    // HTTP URLs, usernames or passwords into diagnostic text.
+    private fun safeFailure(error: Exception): String = when (error) {
+        is java.net.SocketTimeoutException -> "request timed out"
+        is java.net.UnknownHostException -> "server could not be resolved"
+        is java.net.ConnectException -> "connection refused"
+        is org.json.JSONException -> "unexpected response format (not a supported JSON catalogue)"
+        else -> {
+            val reason = error.message.orEmpty()
+            when {
+                reason.startsWith("Server returned HTTP ") ->
+                    "HTTP ${reason.substringAfter("Server returned HTTP ").takeWhile(Char::isDigit)}"
+                reason.contains("exceeds supported limit", true) -> "catalogue too large for a single response"
+                else -> "request unavailable (${error.javaClass.simpleName})"
+            }
+        }
+    }
+
+    private fun fetchArray(config: ProviderConfig, action: String, categoryId: String = ""): FetchOutcome {
+        return try {
+            val payload = Net.readText(api(config, action, categoryId = categoryId), 80_000_000).trim()
+            val array = when {
+                payload.startsWith("[") -> JSONArray(payload)
+                payload.startsWith("{") -> {
+                    val obj = JSONObject(payload)
+                    sequenceOf("data", "results", "items", "streams", "movies", "series", "categories")
+                        .mapNotNull { obj.optJSONArray(it) }.firstOrNull()
+                        ?: return FetchOutcome(emptyList(), "unsupported catalogue object")
+                }
+                payload == "[]" -> JSONArray()
+                payload.isEmpty() || payload == "null" || payload == "false" ->
+                    return FetchOutcome(emptyList(), "no catalogue returned by provider")
+                else -> return FetchOutcome(emptyList(), "provider returned a non-JSON catalogue")
+            }
+            val rows = array.asObjects()
+            FetchOutcome(rows, "${rows.size} returned")
+        } catch (e: Exception) {
+            Log.w("LumaTV", "Xtream $action request failed: ${errorKind(e)}")
+            FetchOutcome(emptyList(), safeFailure(e))
+        }
+    }
+
+    private fun errorKind(error: Exception): String = error.javaClass.simpleName
+
+    // If the global VOD/series response is empty, too large or unsupported,
+    // retry by category: many provider panels support only category requests.
+    private fun fetchCatalogue(
+        config: ProviderConfig, action: String, categories: List<JSONObject>
+    ): FetchOutcome {
+        val full = fetchArray(config, action)
+        // An explicit auth/rate-limit rejection is not fixed by retrying 80 categories.
+        if (full.rows.isNotEmpty() || categories.isEmpty() ||
+            listOf("HTTP 401", "HTTP 403", "HTTP 429").any { full.note == it }) return full
+        val ids = categories.mapNotNull { it.optString("category_id").takeIf(String::isNotBlank) }
+            .distinct().take(80)
+        if (ids.isEmpty()) return full
+        val recovered = ArrayList<JSONObject>()
+        var succeeded = 0
+        var failed = 0
+        var attempted = 0
+        val deadline = System.nanoTime() + 90_000_000_000L
+        for (id in ids) {
+            if (System.nanoTime() > deadline) break
+            val response = fetchArray(config, action, id)
+            attempted++
+            if (response.note.contains("returned")) succeeded++ else failed++
+            recovered.addAll(response.rows)
+            if (listOf("HTTP 401", "HTTP 403", "HTTP 429").any { response.note == it }) break
+        }
+        val unique = recovered.distinctBy {
+            it.optString("stream_id").ifBlank { it.optString("series_id") }
+        }
+        return FetchOutcome(unique,
+            "${unique.size} returned from $succeeded/$attempted successful category requests" +
+            (if (unique.isEmpty()) " (global: ${full.note}; category errors: $failed)" else "") +
+            (if (attempted < categories.size) " (not all categories checked; retry refresh or use Xtream login)" else ""))
+    }
+
+    private fun loadXtream(config: ProviderConfig, loadLive: Boolean = true): CatalogLoad {
         require(Net.validHttp(config.url)) { "Enter a full http:// or https:// server address." }
         val status = JSONObject(Net.readText(api(config), 1_000_000))
         val auth = status.optJSONObject("user_info") ?: error("The server did not return valid account information.")
         if (auth.optString("auth") != "1") error("The provider rejected the login details.")
-        val liveGroups = array(config, "get_live_categories").associate {
+        val liveCategories = if (loadLive) fetchArray(config, "get_live_categories") else FetchOutcome(emptyList(), "skipped")
+        val movieCategories = fetchArray(config, "get_vod_categories")
+        val seriesCategories = fetchArray(config, "get_series_categories")
+        val liveGroups = liveCategories.rows.associate {
             it.optString("category_id") to it.optString("category_name", "Live TV")
         }
-        val movieGroups = array(config, "get_vod_categories").associate {
+        val movieGroups = movieCategories.rows.associate {
             it.optString("category_id") to it.optString("category_name", "Films")
         }
-        val seriesGroups = array(config, "get_series_categories").associate {
+        val seriesGroups = seriesCategories.rows.associate {
             it.optString("category_id") to it.optString("category_name", "Series")
         }
+        val liveResponse = if (loadLive) fetchArray(config, "get_live_streams") else FetchOutcome(emptyList(), "skipped")
+        val movieResponse = fetchCatalogue(config, "get_vod_streams", movieCategories.rows)
+        val seriesResponse = fetchCatalogue(config, "get_series", seriesCategories.rows)
         val base = config.url.trimEnd('/')
         val u = Net.urlEncode(config.username)
         val p = Net.urlEncode(config.password)
-        val live = array(config, "get_live_streams").map { j ->
-            val sid = j.optString("stream_id")
+        val live = liveResponse.rows.mapNotNull { j ->
+            val sid = j.optString("stream_id").takeIf { it.isNotBlank() } ?: return@mapNotNull null
             val extension = if (config.liveFormat == "ts") "ts" else "m3u8"
             MediaEntry(
                 id = makeId("live", base, sid), title = j.optString("name", "Channel"),
@@ -144,43 +278,57 @@ object SourceService {
                 image = j.optString("stream_icon"), epgId = j.optString("epg_channel_id")
             )
         }
-        val vod = array(config, "get_vod_streams").map { j ->
-            val sid = j.optString("stream_id")
-            val ext = j.optString("container_extension", "mp4").let { if (it.matches(Regex("[a-zA-Z0-9]{2,5}"))) it else "mp4" }
+        val vod = movieResponse.rows.mapNotNull { j ->
+            val sid = j.optString("stream_id").takeIf { it.isNotBlank() } ?: return@mapNotNull null
+            val ext = j.optString("container_extension", "mp4").let {
+                if (it.matches(Regex("[a-zA-Z0-9]{2,5}"))) it else "mp4"
+            }
             MediaEntry(
                 id = makeId("movie", base, sid), title = j.optString("name", "Film"),
                 url = "$base/movie/$u/$p/$sid.$ext", type = ContentType.MOVIE,
                 group = movieGroups[j.optString("category_id")] ?: "Films",
-                image = j.optString("stream_icon"), description = j.optString("plot"),
-                backdrop = j.optString("cover_big")
+                image = j.optString("stream_icon").ifBlank { j.optString("cover") },
+                description = j.optString("plot"), backdrop = j.optString("cover_big")
             )
         }
-        val shows = array(config, "get_series").map { j ->
-            val sid = j.optString("series_id")
+        val shows = seriesResponse.rows.mapNotNull { j ->
+            val sid = j.optString("series_id").takeIf { it.isNotBlank() } ?: return@mapNotNull null
             MediaEntry(
                 id = makeId("series", base, sid), title = j.optString("name", "Show"),
                 type = ContentType.SERIES, group = seriesGroups[j.optString("category_id")] ?: "Series",
-                image = j.optString("cover"), description = j.optString("plot"),
-                seriesId = sid, backdrop = j.optJSONArray("backdrop")?.optString(0)
-                    ?: j.optString("backdrop")
+                image = j.optString("cover").ifBlank { j.optString("stream_icon") },
+                description = j.optString("plot"), seriesId = sid,
+                backdrop = j.optJSONArray("backdrop")?.optString(0) ?: j.optString("backdrop")
             )
         }
         val all = live + vod + shows
-        if (all.isEmpty()) error("This account returned no channels, films or shows.")
-        return all
+        if (all.isEmpty() && loadLive) error("The provider returned no playable media. Check the provider login and Source diagnostics.")
+        return CatalogLoad(all, "Xtream catalogue\n" +
+            "Live TV: ${live.size} (${liveResponse.note})\n" +
+            "Films: ${vod.size} (${movieResponse.note})\n" +
+            "Series: ${shows.size} (${seriesResponse.note})\n\n" +
+            "Movie categories: ${movieCategories.rows.size} (${movieCategories.note})\n" +
+            "Series categories: ${seriesCategories.rows.size} (${seriesCategories.note})\n" +
+            "If your provider has films/series but these counts are zero, check whether its Xtream login enables VOD and Series APIs.")
     }
 
     fun episodes(config: ProviderConfig, show: MediaEntry): List<MediaEntry> {
-        if (config.kind != "xtream") {
+        // Shows automatically discovered through an M3U login use Xtream episode APIs too.
+        val source = if (config.kind == "xtream") config else {
+            val derived = xtreamFromM3u(config)
+            if (derived != null && show.id == makeId("series", derived.url.trimEnd('/'), show.seriesId)) derived
+            else null
+        }
+        if (source == null) {
             return AppData.entries.filter { it.type == ContentType.EPISODE && it.seriesId == show.seriesId }
                 .sortedWith(compareBy({ it.season }, { it.episode }, { it.title }))
         }
-        val obj = JSONObject(Net.readText(api(config, "get_series_info", show.seriesId), 20_000_000))
+        val obj = JSONObject(Net.readText(api(source, "get_series_info", show.seriesId), 20_000_000))
         val seasons = obj.optJSONObject("episodes") ?: error("No episodes were returned for this series.")
         val result = mutableListOf<MediaEntry>()
-        val base = config.url.trimEnd('/')
-        val u = Net.urlEncode(config.username)
-        val p = Net.urlEncode(config.password)
+        val base = source.url.trimEnd('/')
+        val u = Net.urlEncode(source.username)
+        val p = Net.urlEncode(source.password)
         val keys = seasons.keys()
         while (keys.hasNext()) {
             val seasonKey = keys.next()
