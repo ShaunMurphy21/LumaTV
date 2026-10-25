@@ -64,6 +64,7 @@ class MainActivity : Activity() {
     private val liveWorker = Executors.newSingleThreadExecutor()
     private var liveLoading = false
     private var liveFailure = ""
+    private var initialTitlesRendered = false
     private var liveMessage = "Loading Live TV channels"
     private val main = Handler(Looper.getMainLooper())
     private var tab = "Home"
@@ -665,14 +666,20 @@ class MainActivity : Activity() {
                 })
             }
             val message = when (tab) {
-                "Films" -> "No films found. Refresh your library in Settings. Your provider must expose VOD films or your M3U must identify film groups."
-                "Series" -> "No series found. Refresh your library in Settings. Xtream needs a series catalogue; M3U needs labelled series episodes."
+                "Films" -> if (importing)
+                    "Importing films in the background. Categories and film titles will appear as they download."
+                else "No films available. Check catalogue diagnostics or refresh the source."
+                "Series" -> if (importing)
+                    "Importing series in the background. Versions and subtitle editions will appear as categories finish."
+                else "No series available. Check catalogue diagnostics or refresh the source."
                 "Live TV" -> when {
                     liveLoading -> liveMessage + " — Films and Series can still be used."
                     liveFailure.isNotBlank() -> liveFailure
                     else -> "No live channels loaded. Try loading channels or check your channel filters."
                 }
-                else -> "Nothing here yet. Try another category or add a playlist."
+                else -> if (importing)
+                    "Importing all Films and Series in the background. Select Films or Series to browse available titles."
+                else "Nothing here yet. Try another category or add a playlist."
             }
             layout.addView(Ui.text(this, message, 15f, Ui.MUTED).apply {
                 setPadding(dp(23), dp(35), dp(23), 0)
@@ -1032,6 +1039,7 @@ class MainActivity : Activity() {
             importing = true
             loadingMessage = "Reading Film and Series categories"
             loadingDone = 0; loadingTotal = 0
+            initialTitlesRendered = false
             liveLoading = false
             errorText = ""
             storage.markCatalogRefreshed()
@@ -1123,6 +1131,7 @@ class MainActivity : Activity() {
         loadingDone = 0; loadingTotal = 0
         importing = true
         cancelImportRequested = false
+        initialTitlesRendered = false
         updateProgressViews()
         worker.execute {
             try { importCompleteLibrary(config) }
@@ -1161,6 +1170,11 @@ class MainActivity : Activity() {
                     if (loading && (progress.films + progress.series > 0)) {
                         loading = false
                         render()
+                    } else if (!initialTitlesRendered &&
+                        (progress.films + progress.series > 0)) {
+                        // Show the first batch immediately, then preserve focus.
+                        initialTitlesRendered = true
+                        if (tab == "Home" || tab == "Films" || tab == "Series") render()
                     }
                     updateProgressViews()
                 }
