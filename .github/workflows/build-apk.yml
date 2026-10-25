@@ -42,6 +42,9 @@ jobs:
         with:
           gradle-version: '8.11.1'
 
+      - name: Test series language and subtitle variants
+        run: gradle --no-daemon --stacktrace :app:testDebugUnitTest
+
       - name: Compile debug APK
         run: gradle --no-daemon --stacktrace :app:assembleDebug
 
