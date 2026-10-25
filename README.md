@@ -21,25 +21,31 @@ A native Android, Netflix-inspired IPTV application with a responsive interface 
 - A demo library containing public test/example media URLs for evaluating the interface
 - Optional per-stream User-Agent and Referer support from M3U `#EXTVLCOPT`
 
+## v1.0.1 build fix
+
+GitHub Actions now uses `android-actions/setup-android@v4`. The earlier workflow was blocked before compilation when its v3 action attempted to install Google's discontinued legacy `tools` package. The v4 action installs current command-line tools and `platform-tools` without this obsolete dependency. We also explicitly install Android platform 36 and Build Tools 35.0.0 (compatible with AGP 8.10.1), check the APK exists, and upload it as a downloadable artifact.
+
+**Important:** This source archive has been inspected and repackaged, but compilation has **not** been verified here. If the workflow reaches compilation and reports a new error, open that step and share the error output for the next fix.
+
 ## Build an APK with only your Samsung phone (GitHub cloud build)
 
 Requirements: free GitHub account, Chrome/Samsung Internet (desktop site can help), and internet access. Some accounts may need Codespaces access; GitHub's usage limits may apply.
 
-1. Download **LumaTV-Android-Source.zip** to your Samsung.
-2. Sign into [github.com](https://github.com) and create a new, empty *private* repository, e.g. `LumaTV`. Don't create an initial README; this ZIP already has one.
-3. In the new repository, tap **Code → Codespaces → Create codespace on main**. This opens a web-based editor, no laptop required.
-4. In the Codespaces file explorer, use **Upload...** to upload your downloaded `LumaTV-Android-Source.zip` into the repository root. If the Upload option is hidden on mobile, use your browser's **Desktop site** setting.
+1. Download **LumaTV-v1.0.1-Fixed-Build.zip** to your Samsung.
+2. Open your existing `ShaunMurphy21/LumaTV` repository in [github.com](https://github.com).
+3. Tap **Code → Codespaces**, then **open your existing Codespace** (or create one if needed). This opens a web-based editor, no laptop required.
+4. In the Codespaces file explorer, use **Upload...** to upload `LumaTV-v1.0.1-Fixed-Build.zip` to the repository root (the folder containing `app` and `.github`). If the Upload option is hidden, enable your browser's **Desktop site** setting.
 5. Open the Codespaces terminal and enter these commands:
 
    ```sh
-   unzip -o LumaTV-Android-Source.zip
-   rm LumaTV-Android-Source.zip
+   unzip -o LumaTV-v1.0.1-Fixed-Build.zip
+   rm LumaTV-v1.0.1-Fixed-Build.zip
    git add .
-   git commit -m "Add LumaTV Android app"
+   git commit -m "Fix Android SDK setup and update LumaTV to 1.0.1"
    git push
    ```
 
-6. In GitHub, open the repository's **Actions** tab and select **Build installable Android APK**. The build starts after the push (or tap **Run workflow** if required).
+6. In GitHub, open the repository's **Actions** tab and select **Build installable Android APK**. Pushing to `main` starts the build, or tap **Run workflow** manually.
 7. Open the successful workflow run → **Artifacts** → **LumaTV-debug-apk**. Download and extract the artifact ZIP on your Samsung. Inside is `app-debug.apk`.
 8. Open `app-debug.apk` and allow installation from that source when Android prompts. You can revoke the installation permission afterwards.
 
@@ -47,7 +53,7 @@ Requirements: free GitHub account, Chrome/Samsung Internet (desktop site can hel
 
 ## Build with Android Studio on a computer (optional)
 
-Open the `LumaTV` directory as a Gradle project in Android Studio, use JDK 17, install Android SDK 36 and Build Tools 36, use Gradle 8.11.1, then assemble the `debug` variant. Gradle dependencies resolve from Google Maven and Maven Central. A Gradle wrapper JAR is not bundled; the CI workflow supplies Gradle automatically.
+Open the `LumaTV` directory as a Gradle project in Android Studio, use JDK 17, install Android SDK 36 and Build Tools 35.0.0, use Gradle 8.11.1, then assemble the `debug` variant. Gradle dependencies resolve from Google Maven and Maven Central. A Gradle wrapper JAR is not bundled; the CI workflow supplies Gradle automatically.
 
 ## Setting up LumaTV
 
