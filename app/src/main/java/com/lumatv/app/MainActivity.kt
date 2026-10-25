@@ -98,6 +98,8 @@ class MainActivity : Activity() {
                     } else {
                         AppData.entries = cached
                         render()
+                        if (SourceService.xtreamFor(provider) != null &&
+                            !storage.fullImportComplete()) resumeFullImport(provider)
                         if (SourceService.epgUrl(provider).isNotBlank()) fetchEpg(provider, cached)
                     }
                 }
@@ -278,12 +280,40 @@ class MainActivity : Activity() {
     }
 
     private fun showLoading() {
-        val shell = Ui.vertical(this).apply { gravity = Gravity.CENTER }
-        shell.addView(ProgressBar(this).apply { isIndeterminate = true })
-        shell.addView(Ui.text(this, "Connecting to your library…", 17f, Ui.WHITE, true).apply {
-            gravity = Gravity.CENTER; setPadding(0, dp(24), 0, dp(8))
-        })
-        shell.addView(Ui.text(this, "Importing channels, artwork and categories", 12f, Ui.MUTED).apply { gravity = Gravity.CENTER })
+        val shell = Ui.vertical(this).apply {
+            gravity = Gravity.CENTER
+            setPadding(dp(22), dp(18), dp(22), dp(18))
+        }
+        shell.addView(Ui.text(this, "Building your IPTV library", 24f, Ui.WHITE, true).apply {
+            gravity = Gravity.CENTER
+        }, Ui.columnParams(this, 18))
+        shell.addView(Ui.text(this, loadingMessage, 15f, Ui.MINT, true).apply {
+            gravity = Gravity.CENTER
+            maxLines = 2
+        }, Ui.columnParams(this, 16))
+        val indicator = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+            max = if (loadingTotal > 0) loadingTotal else 100
+            progress = if (loadingTotal > 0) loadingDone.coerceIn(0, loadingTotal) else 0
+            isIndeterminate = loadingTotal == 0
+        }
+        shell.addView(indicator, LinearLayout.LayoutParams(-1, dp(14)))
+        val fraction = if (loadingTotal > 0) "$loadingDone / $loadingTotal categories" else "Connecting…"
+        shell.addView(Ui.text(this, fraction, 16f, Ui.WHITE, true).apply {
+            gravity = Gravity.CENTER
+        }, Ui.columnParams(this, 14))
+        if (loadingTotal > 0) {
+            shell.addView(Ui.text(this,
+                "Films: $loadingFilms     Series: $loadingShows     Failed: $loadingFailures",
+                13f, Ui.MUTED).apply { gravity = Gravity.CENTER }, Ui.columnParams(this, 15))
+            shell.addView(Ui.text(this,
+                "Importing all provider categories into device storage. Already completed categories are skipped after reopening the app.",
+                12f, Ui.MUTED).apply { gravity = Gravity.CENTER },
+                Ui.columnParams(this, 16))
+            shell.addView(Ui.button(this, "Browse downloaded titles", false) {
+                loading = false
+                render()
+            })
+        }
         body.addView(shell, FrameLayout.LayoutParams(-1, -1))
     }
 
@@ -327,9 +357,13 @@ class MainActivity : Activity() {
             catalogue.count(ContentType.SERIES) == 0) { showBrowse(list, "Your library"); return }
         val scroll = ScrollView(this).apply { clipToPadding = false }
         val column = Ui.vertical(this)
+        val previewConfig = AppData.config?.let { SourceService.xtreamFor(it) }
         val hero = list.firstOrNull { it.type == ContentType.MOVIE && it.image.isNotBlank() }
             ?: list.firstOrNull { it.type == ContentType.SERIES && it.image.isNotBlank() }
-            ?: list.first()
+            ?: previewConfig?.let { catalogue.page(it, ContentType.MOVIE, limit = 1).firstOrNull() }
+            ?: previewConfig?.let { catalogue.page(it, ContentType.SERIES, limit = 1).firstOrNull() }
+            ?: list.firstOrNull()
+        if (hero == null) return
         column.addView(makeHero(hero), Ui.columnParams(this, 18))
         val recents = storage.recents(list)
         if (recents.isNotEmpty()) shelf(column, "Continue watching", recents)
@@ -786,40 +820,106 @@ class MainActivity : Activity() {
         AppData.catalogReport = ""
         AppData.episodeQueue = emptyList(); AppData.episodeQueueFor = ""
         storage.saveProvider(config)
+        loadingDone = 0; loadingTotal = 0
         refresh()
     }
 
     private fun refresh() {
         val config = AppData.config ?: return
         if (loading) return
-        loading = true; errorText = ""; render()
+        loading = true
+        loadingMessage = "Connecting to your live channels"
+        loadingDone = 0; loadingTotal = 0
+        errorText = ""
+        render()
         worker.execute {
             try {
-                val result = SourceService.loadDetailed(this, config)
-                val entries = result.entries
+                // Bootstrap Live TV without importing and duplicating 80 categories of VOD.
+                val result = if (config.kind == "xtream")
+                    SourceService.loadXtreamLive(config) else SourceService.loadDetailed(this, config)
                 if (AppData.config != config) return@execute
-                storage.saveCatalog(entries)
+                storage.saveCatalog(result.entries)
                 storage.saveCatalogReport(result.report)
                 storage.markCatalogRefreshed()
-                main.post {
-                    if (isFinishing || isDestroyed) return@post
-                    if (AppData.config != config) return@post
-                    AppData.entries = entries
-                    AppData.catalogReport = result.report
-                    loading = false
-                    category = "All"
-                    render()
-                    if (SourceService.epgUrl(config).isNotBlank()) fetchEpg(config, entries)
+                AppData.entries = result.entries
+                AppData.catalogReport = result.report
+                if (SourceService.xtreamFor(config) != null) {
+                    // The full import runs on the existing background worker.
+                    importCompleteLibrary(config)
+                } else {
+                    main.post {
+                        if (isFinishing || isDestroyed || AppData.config != config) return@post
+                        loading = false
+                        category = "All"
+                        render()
+                    }
                 }
+                if (SourceService.epgUrl(config).isNotBlank()) fetchEpg(config, result.entries)
             } catch (e: Exception) {
                 main.post {
-                    if (isFinishing || isDestroyed) return@post
-                    if (AppData.config != config) return@post
-                    loading = false; errorText = e.message ?: "Failed to connect to the source"
+                    if (isFinishing || isDestroyed || AppData.config != config) return@post
+                    loading = false
+                    errorText = e.message ?: "Failed to connect to the source"
                     render()
                     Toast.makeText(this, "Import failed: ${e.message}", Toast.LENGTH_LONG).show()
                 }
             }
+        }
+    }
+
+    private fun resumeFullImport(config: ProviderConfig) {
+        if (loading) return
+        loading = true
+        loadingMessage = "Resuming unfinished catalogue"
+        loadingDone = 0; loadingTotal = 0
+        render()
+        worker.execute {
+            try { importCompleteLibrary(config) }
+            catch (e: Exception) {
+                main.post {
+                    if (isFinishing || isDestroyed || AppData.config != config) return@post
+                    loading = false
+                    Toast.makeText(this, "Catalogue retry: ${e.message}", Toast.LENGTH_LONG).show()
+                    render()
+                }
+            }
+        }
+    }
+
+    private fun importCompleteLibrary(config: ProviderConfig) {
+        progressEvents = 0
+        val outcome = SourceService.importAllVod(config, catalogue, { progress ->
+            progressEvents++
+            if (progressEvents % 4 == 0 || progress.done == progress.total ||
+                progress.total > 0 && progressEvents == 1) {
+                main.post {
+                    if (isFinishing || isDestroyed || AppData.config != config) return@post
+                    loadingDone = progress.done; loadingTotal = progress.total
+                    loadingMessage = progress.category
+                    loadingFilms = progress.films; loadingShows = progress.series
+                    loadingFailures = progress.failed
+                    if (loading) render()
+                }
+            }
+        }, isCancelled = { AppData.config != config || Thread.currentThread().isInterrupted })
+        storage.markFullImportComplete(outcome.done == outcome.total)
+        val report = "Full provider import\nFilms: ${outcome.films}\n" +
+            "Series: ${outcome.series}\n" +
+            "Categories completed: ${outcome.done}/${outcome.total}\n" +
+            "Failed this attempt: ${outcome.failed}\n" +
+            "If the import was interrupted, reopen the app to retry outstanding categories."
+        storage.saveCatalogReport(report)
+        main.post {
+            if (isFinishing || isDestroyed || AppData.config != config) return@post
+            AppData.catalogReport = report
+            loadingDone = outcome.done; loadingTotal = outcome.total
+            loadingFilms = outcome.films; loadingShows = outcome.series
+            loadingFailures = outcome.failed
+            loading = false
+            category = "All"
+            render()
+            if (outcome.failed > 0) Toast.makeText(this,
+                "Some provider categories failed. Reopen the app to retry.", Toast.LENGTH_LONG).show()
         }
     }
 
