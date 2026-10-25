@@ -11,8 +11,8 @@ android {
         applicationId = "com.lumatv.app"
         minSdk = 23
         targetSdk = 35
-        versionCode = 6
-        versionName = "1.2.1"
+        versionCode = 7
+        versionName = "1.3.0"
     }
     buildTypes {
         release {
@@ -34,4 +34,5 @@ dependencies {
     implementation("androidx.media3:media3-exoplayer-hls:1.11.1")
     implementation("androidx.media3:media3-exoplayer-dash:1.11.1")
     implementation("androidx.media3:media3-ui:1.11.1")
+    testImplementation("junit:junit:4.13.2")
 }
