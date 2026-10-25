@@ -303,7 +303,15 @@ class MainActivity : Activity() {
         if (recents.isNotEmpty()) shelf(column, "Continue watching", recents)
         shelf(column, "Live right now", list.filter { it.type == ContentType.LIVE }.take(25))
         shelf(column, "Films for you", list.filter { it.type == ContentType.MOVIE }.take(25))
-        shelf(column, "Series to discover", list.filter { it.type == ContentType.SERIES }.take(25))
+        val shows = list.filter { it.type == ContentType.SERIES }
+        shelf(column, "Series to discover", shows.take(25))
+        if (shows.size > 25) {
+            column.addView(Ui.button(this, "Browse all ${shows.size} series and language editions", false) {
+                tab = "Series"; category = "All"; clearSearch()
+                searchBox.hint = searchHint()
+                render()
+            }, Ui.columnParams(this, 14).apply { leftMargin = dp(17); rightMargin = dp(17) })
+        }
         val interesting = list.groupBy { it.type to it.group }
             .filter { (k, v) -> v.size >= 4 && k.second.isNotBlank() }
             .entries.sortedByDescending { it.value.size }.take(7)
